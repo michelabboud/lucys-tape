@@ -1,5 +1,7 @@
 # 📼 Lucy's Tape
 
+![Lucy's Tape — conversations becoming memory](docs/assets/lucys-tape-hero.webp)
+
 **Your AI wakes up every morning with no memory of yesterday. This is the tape you make it.**
 
 Lucy's Tape is a self-hosted, secret-scrubbed, searchable archive of every
