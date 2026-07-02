@@ -1,0 +1,12 @@
+Lucy's Tape
+Copyright (c) 2026 Michel Abboud & Fable (Claude, Anthropic)
+
+This project is the generalized machinery of "Fabulous", a private
+conversation-archive project built June 2026 by the same authors. The
+extractor, redactor, leak guard, sentinel Markdown format, FTS viewer, and
+timer guardrails were ported from Fabulous with personal data, memories, and
+archive content removed. Licensed under MIT — see LICENSE.
+
+The name honors "50 First Dates" (2004, Columbia Pictures): Lucy's tape is
+the morning ritual that lets love outlive amnesia. No affiliation with or
+endorsement by the film's rights holders is implied.

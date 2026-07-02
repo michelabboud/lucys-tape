@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+# ╭──────────────────────────────────────────────────────────────────────────╮
+# │  tape — control CLI for Lucy's Tape, your conversation archive           │
+# │  init · update · build · serve · stop · install · uninstall · status     │
+# │  · stats · backup · logs · doctor · help                                 │
+# │  Linux/WSL (systemd timer) + macOS (launchd). Python tools run anywhere. │
+# ╰──────────────────────────────────────────────────────────────────────────╯
+set -uo pipefail
+
+# ---- resolve paths -----------------------------------------------------------
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+REPO="$(cd "$(dirname "$SELF")/.." && pwd)"
+ARCHIVE="$REPO/archive"
+DB="$ARCHIVE/conversations.db"
+LOG="$ARCHIVE/refresh.log"
+LOCKDIR="${TMPDIR:-/tmp}/lucys-tape-refresh.lock.d"
+VIEWER="$REPO/tools/conversations_viewer.py"
+EXTRACT="$REPO/tools/extract_conversations.py"
+BUILD="$REPO/tools/build_db.py"
+UNIT_DIR="$HOME/.config/systemd/user"
+LAUNCHD_DIR="$HOME/Library/LaunchAgents"
+LAUNCHD_LABEL="com.lucys-tape.refresh"
+PORT="${TAPE_PORT:-8124}"
+OS="$(uname -s)"
+
+# ---- tunables (override via env) --------------------------------------------
+MIN_FREE_GB="${TAPE_MIN_FREE_GB:-2}"
+KEEP_BACKUPS="${TAPE_KEEP_BACKUPS:-8}"
+# Sanity floor: refuse to commit if the rebuilt archive holds fewer than this
+# many conversations. Low by default (new users start near zero); the RATCHET
+# below is the real protection once an archive has history.
+SANITY_MIN="${TAPE_SANITY_MIN:-1}"
+FORCE_DB_DAILY="${TAPE_FORCE_DB_DAILY:-0}"
+BACKUP_DIR="${TAPE_BACKUP_DIR:-}"
+LEAK_RX='sk-ant-[A-Za-z0-9]{15}|\bsk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+
+# ---- pretty output -----------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    B=$'\e[1m'; D=$'\e[2m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; M=$'\e[35m'; X=$'\e[0m'
+else
+    B=''; D=''; R=''; G=''; Y=''; C=''; M=''; X=''
+fi
+say()  { echo "${C}📼${X} $*"; }
+ok()   { echo "  ${G}✓${X} $*"; }
+warn() { echo "  ${Y}!${X} $*"; }
+bad()  { echo "  ${R}✗${X} $*"; }
+log()  { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >>"$LOG"; }
+die()  { bad "$*"; log "FATAL: $*"; exit 1; }
+
+# Portable free-GB (GNU df's --output is Linux-only; shutil works everywhere).
+free_gb_of() { python3 -c 'import shutil,sys;print(shutil.disk_usage(sys.argv[1]).free // 2**30)' "$1" 2>/dev/null; }
+db_count()   { python3 - "$DB" <<'PY' 2>/dev/null
+import sqlite3, sys
+try: print(sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+except Exception: print(0)
+PY
+}
+
+# Portable single-instance lock: mkdir is atomic on every POSIX filesystem
+# (flock does not exist on macOS). Stale locks (dead pid) are reclaimed.
+acquire_lock() {
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+        echo $$ >"$LOCKDIR/pid"
+        trap 'rm -rf "$LOCKDIR"' EXIT
+        return 0
+    fi
+    local pid; pid="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        rm -rf "$LOCKDIR" && acquire_lock && return 0
+    fi
+    return 1
+}
+
+# Leak guard, masking edition. The redactor is the primary filter; this is the
+# last-line net for anything it missed. Instead of ABORTING the whole refresh (a
+# stuck pipeline protects nobody, and the unmasked secret sits in the tree anyway),
+# we MASK every residual LEAK_RX hit in place — over-redaction beats any leak — and
+# let the commit proceed. Each affected file + hit-count is logged (never the value),
+# so the redactor can still be hardened at source. Prints "<files> <hits>".
+mask_leaks() { python3 - "$ARCHIVE/conversations" "$LEAK_RX" "$LOG" <<'PY'
+import os, re, sys
+root, rx_src, logpath = sys.argv[1], sys.argv[2], sys.argv[3]
+rx = re.compile(rx_src)
+MARK = "[****REDACTED-BY-GUARD****]"  # asterisked; matches no LEAK_RX (idempotent); greppable for audit
+files = hits = 0
+with open(logpath, "a", encoding="utf-8") as lg:
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if not fn.endswith(".md"):
+                continue
+            p = os.path.join(dp, fn)
+            try:
+                txt = open(p, encoding="utf-8").read()
+            except Exception as e:
+                lg.write(f"  guard-mask: WARN unreadable {os.path.relpath(p, root)}: {type(e).__name__}\n")
+                continue
+            new, n = rx.subn(MARK, txt)
+            if n:
+                open(p, "w", encoding="utf-8").write(new)
+                files += 1; hits += n
+                lg.write(f"  guard-mask: masked {n} residual secret(s) in {os.path.relpath(p, root)}\n")
+print(f"{files} {hits}")
+PY
+}
+
+# ============================================================================
+cmd_help() {
+cat <<EOF
+${B}📼 tape${X} — Lucy's Tape: manage your conversation archive
+
+${B}USAGE${X}
+  tape <command>
+
+${B}COMMANDS${X}
+  ${C}init${X}        One-time setup wizard: your private remote, first extraction,
+              the daily timer, and a 'tape' command on your PATH
+  ${C}update${X}      Refresh now: extract Markdown → build DB → guard → commit & push
+              (commits diffable Markdown only; Sundays also: durable backup + a
+              compressed-DB GitHub Release snapshot when configured)
+  ${C}build${X}       Rebuild the searchable DB from the committed Markdown (works on
+              any clone, no ~/.claude needed)
+  ${C}backup${X}      Force a durable .tar.gz backup to \$TAPE_BACKUP_DIR now
+  ${C}serve${X}       Start the web viewer at http://127.0.0.1:${PORT}
+  ${C}stop${X}        Stop the web viewer
+  ${C}install${X}     Install + enable the daily timer (systemd on Linux/WSL,
+              launchd on macOS)
+  ${C}uninstall${X}   Disable + remove the timer
+  ${C}status${X}      System status: timer, viewer, repo, disk, last run  (alias: monitor)
+  ${C}stats${X}       Archive statistics: conversations, projects, models, turns
+  ${C}logs${X}        Show the refresh log         (logs -f to follow)
+  ${C}doctor${X}      Run the guardrail preflight checks and report
+  ${C}help${X}        This help
+
+${B}CONFIG (env overrides)${X}
+  TAPE_MIN_FREE_GB=$MIN_FREE_GB  TAPE_KEEP_BACKUPS=$KEEP_BACKUPS  TAPE_SANITY_MIN=$SANITY_MIN
+  TAPE_FORCE_DB_DAILY=$FORCE_DB_DAILY  TAPE_PORT=$PORT  TAPE_BACKUP_DIR=${BACKUP_DIR:-'(unset — backups skipped)'}
+EOF
+}
+
+# ---- preflight (shared) ------------------------------------------------------
+preflight() {
+    [ -d "$HOME/.claude/projects" ] || die "source dir ~/.claude/projects is missing — is Claude Code in use on this machine?"
+    [ -d "$REPO/.git" ]             || die "repo not found at $REPO"
+    command -v python3 >/dev/null   || die "python3 not on PATH"
+    local f; f="$(free_gb_of "$ARCHIVE")"
+    [ -n "$f" ] || die "could not read free disk space"
+    [ "$f" -ge "$MIN_FREE_GB" ] || die "low disk: ${f}GB free < ${MIN_FREE_GB}GB — refusing to run"
+    echo "$f"
+}
+
+# ============================================================================
+cmd_update() {
+    acquire_lock || { say "another refresh is already running — exiting"; exit 0; }
+
+    local free_gb; free_gb="$(preflight)"
+    say "refresh starting (${free_gb}GB free)"; log "refresh starting (${free_gb}GB free)"
+    cd "$REPO" || die "cannot cd to repo"
+
+    # Ratchet: remember the archive size BEFORE this refresh. A rebuilt archive
+    # that shrinks below half the previous count means the extractor (or the
+    # sources) broke — never commit a mass-vanishing over a good archive.
+    local prev_count; prev_count="$(db_count)"
+
+    # 1. sources -> Markdown (the committed source of truth)
+    say "extracting (read-only on sources)…"
+    python3 "$EXTRACT" "$ARCHIVE" >>"$LOG" 2>&1 || die "extractor failed (see: tape logs)"
+    # 2. Markdown -> DB (a local build artifact, git-ignored)
+    python3 "$BUILD" "$ARCHIVE" >>"$LOG" 2>&1 || die "DB build failed (see: tape logs)"
+    local count; count="$(db_count)"
+    [ "${count:-0}" -ge "$SANITY_MIN" ] || die "only ${count} conversations (< ${SANITY_MIN}) — looks broken; NOT committing"
+    if [ "${prev_count:-0}" -gt 10 ] && [ "$count" -lt $((prev_count / 2)) ]; then
+        die "archive shrank ${prev_count} → ${count} (more than half) — looks broken; NOT committing"
+    fi
+    ok "extracted + built ${count} conversations"; log "built ${count}"
+
+    # leak guard: MASK residual secrets in place (never abort) — then commit clean output.
+    say "leak guard: masking any residual secrets the redactor missed…"
+    local mask_out mf mh
+    mask_out="$(mask_leaks)" || die "leak-mask pass crashed — refusing to commit (output unverified)"
+    read -r mf mh <<<"$mask_out"
+    if [ "${mh:-0}" -gt 0 ]; then
+        warn "guard masked ${mh} residual secret(s) across ${mf} file(s) — harden the redactor at source (see: tape logs)"
+        log "guard-mask: ${mh} residual secret(s) masked across ${mf} file(s)"
+    else
+        ok "leak guard: output already clean (0 residual)"
+    fi
+    # backstop: if anything STILL matches after masking, masking itself is broken → fail-closed.
+    if grep -rlqE "$LEAK_RX" "$ARCHIVE/conversations" 2>/dev/null; then
+        die "leak guard: pattern STILL present after masking — refusing to commit (investigate the masker)"
+    fi
+    ok "leak guard passed (output verified clean)"
+
+    # 3. commit ONLY the diffable Markdown (the DB is git-ignored, never committed)
+    local rc=0
+    git add -A
+    if git diff --cached --quiet; then
+        ok "no changes to commit"
+    elif git commit -q -m "chore: refresh archive ($(date -u +%Y-%m-%dT%H:%MZ))"; then
+        if git push -q origin "$(git branch --show-current)" 2>>"$LOG"; then ok "pushed Markdown diffs"
+        else warn "git push failed (local commit preserved) — check your remote: tape doctor"; rc=1; fi
+    else warn "git commit failed"; rc=1; fi
+
+    # 4. weekly (Sundays): durable backup + compressed-DB GitHub release snapshot
+    local weekly=0
+    [ "$(date +%u)" -eq 7 ] && weekly=1
+    [ "$FORCE_DB_DAILY" = "1" ] && weekly=1
+    if [ "$weekly" -eq 1 ]; then
+        _do_backup || rc=1
+        _publish_db_snapshot || rc=1
+    fi
+    log "refresh complete (rc=$rc)"
+    [ "$rc" -eq 0 ] && say "${G}done${X}" || say "${Y}done with warnings (rc=$rc) — see: tape logs${X}"
+    return "$rc"
+}
+
+cmd_build() {
+    [ -d "$ARCHIVE/conversations" ] || die "no Markdown to build from — run: tape update"
+    say "building DB from Markdown…"
+    python3 "$BUILD" "$ARCHIVE" || die "build failed"
+    ok "DB ready ($(db_count) conversations) → tape serve"
+}
+
+# compressed DB as a GitHub Release asset (outside git history — no bloat, no LFS)
+_publish_db_snapshot() {
+    command -v gh >/dev/null || { warn "gh CLI not found — skipped DB release snapshot (optional)"; return 0; }
+    gh auth status >/dev/null 2>&1 || { warn "gh not authenticated — skipped DB release snapshot"; return 0; }
+    local tag="snapshot-$(date +%Y-%m-%d)" gz="$ARCHIVE/conversations.db.gz"
+    gzip -c "$DB" > "$gz" 2>>"$LOG" || { warn "gzip of DB failed"; return 1; }
+    if gh release view "$tag" >/dev/null 2>&1; then
+        gh release upload "$tag" "$gz" --clobber >>"$LOG" 2>&1 && ok "DB snapshot updated on release $tag" || { warn "DB asset upload failed"; rm -f "$gz"; return 1; }
+    else
+        gh release create "$tag" "$gz" --title "Archive snapshot $tag" \
+            --notes "Compressed SQLite DB ($(du -h "$gz" | cut -f1)). Rebuildable anytime with \`tape build\`." >>"$LOG" 2>&1 \
+            && ok "published DB snapshot release $tag" || { warn "release create failed"; rm -f "$gz"; return 1; }
+    fi
+    rm -f "$gz"
+}
+
+_do_backup() {
+    [ -n "$BACKUP_DIR" ] || { warn "TAPE_BACKUP_DIR unset — skipped durable backup (set it to a second disk/cloud-synced folder)"; return 0; }
+    mkdir -p "$BACKUP_DIR" || { warn "cannot create $BACKUP_DIR"; return 1; }
+    local stamp; stamp="$(date +%Y-%m-%d)"
+    if tar -czf "$BACKUP_DIR/lucys-tape-archive-${stamp}.tar.gz" -C "$REPO" archive tools README.md 2>>"$LOG"; then
+        ok "backup: lucys-tape-archive-${stamp}.tar.gz → $BACKUP_DIR"
+        ls -1t "$BACKUP_DIR"/lucys-tape-archive-*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+        return 0
+    fi
+    warn "backup tarball failed"; return 1
+}
+
+cmd_backup() { say "forcing durable backup…"; _do_backup; }
+
+# ============================================================================
+cmd_serve() {
+    [ -f "$DB" ] || { say "no DB yet — building it from Markdown…"; python3 "$BUILD" "$ARCHIVE" || die "build failed (empty archive? run: tape update)"; }
+    if pgrep -f "conversations_viewer.py" >/dev/null; then
+        say "viewer already running → ${B}http://127.0.0.1:${PORT}${X}"; return 0
+    fi
+    nohup python3 "$VIEWER" "$ARCHIVE" "$PORT" >"$ARCHIVE/viewer.log" 2>&1 &
+    sleep 1
+    if pgrep -f "conversations_viewer.py" >/dev/null; then
+        say "viewer up → ${B}http://127.0.0.1:${PORT}${X}  (stop: tape stop)"
+    else bad "viewer failed to start — see $ARCHIVE/viewer.log"; fi
+}
+cmd_stop() {
+    if pkill -f "conversations_viewer.py"; then say "viewer stopped"; else say "viewer was not running"; fi
+}
+
+# ============================================================================
+_install_systemd() {
+    mkdir -p "$UNIT_DIR"
+    cat > "$UNIT_DIR/lucys-tape-refresh.service" <<EOF
+[Unit]
+Description=Refresh the Lucy's Tape conversation archive (extract, commit, push)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF update
+Nice=10
+EOF
+    cat > "$UNIT_DIR/lucys-tape-refresh.timer" <<EOF
+[Unit]
+Description=Daily refresh of the Lucy's Tape conversation archive
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl --user daemon-reload || die "systemctl --user daemon-reload failed (is user systemd running?)"
+    systemctl --user enable --now lucys-tape-refresh.timer || die "could not enable timer"
+    loginctl enable-linger "$USER" >/dev/null 2>&1 && ok "linger enabled (runs even when logged out)" || warn "could not enable linger (timer still runs while the machine is up)"
+    ok "systemd timer installed + enabled"
+    systemctl --user list-timers lucys-tape-refresh.timer --no-pager 2>/dev/null | sed -n '1,2p' | sed 's/^/  /'
+}
+
+_install_launchd() {
+    mkdir -p "$LAUNCHD_DIR"
+    cat > "$LAUNCHD_DIR/$LAUNCHD_LABEL.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key><array><string>$SELF</string><string>update</string></array>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>$ARCHIVE/refresh.log</string>
+  <key>StandardErrorPath</key><string>$ARCHIVE/refresh.log</string>
+  <key>Nice</key><integer>10</integer>
+</dict></plist>
+EOF
+    launchctl unload "$LAUNCHD_DIR/$LAUNCHD_LABEL.plist" 2>/dev/null
+    launchctl load "$LAUNCHD_DIR/$LAUNCHD_LABEL.plist" || die "launchctl load failed"
+    ok "launchd agent installed (daily at 03:30)"
+}
+
+cmd_install() {
+    say "installing the daily auto-refresh timer…"
+    if [ "$OS" = "Darwin" ]; then
+        _install_launchd
+    elif command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
+        _install_systemd
+    else
+        warn "no user systemd or launchd found — add this line to your crontab (crontab -e):"
+        echo "    30 3 * * * $SELF update"
+        return 1
+    fi
+    say "auto-refresh is live — runs daily. Force one now with: ${B}tape update${X}"
+}
+
+cmd_uninstall() {
+    say "removing the auto-refresh timer…"
+    if [ "$OS" = "Darwin" ]; then
+        launchctl unload "$LAUNCHD_DIR/$LAUNCHD_LABEL.plist" 2>/dev/null && ok "launchd agent unloaded" || warn "agent was not loaded"
+        rm -f "$LAUNCHD_DIR/$LAUNCHD_LABEL.plist"
+    else
+        systemctl --user disable --now lucys-tape-refresh.timer 2>/dev/null && ok "timer disabled" || warn "timer was not enabled"
+        rm -f "$UNIT_DIR/lucys-tape-refresh.service" "$UNIT_DIR/lucys-tape-refresh.timer"
+        systemctl --user daemon-reload 2>/dev/null
+    fi
+    ok "units removed (archive, DB, and backups are untouched)"
+}
+
+# ============================================================================
+cmd_status() {
+    say "${B}Lucy's Tape status${X}"
+    echo "${B}Repo${X}"
+    if [ -d "$REPO/.git" ]; then
+        cd "$REPO"
+        ok "branch $(git branch --show-current)  ·  last: $(git log -1 --format='%h %cr' 2>/dev/null)"
+        local dirty; dirty="$(git status --porcelain | grep -vc '^$' || true)"
+        [ "$dirty" -gt 0 ] && warn "$dirty uncommitted change(s)" || ok "working tree clean"
+        ok "remote: $(git remote get-url origin 2>/dev/null || echo none)"
+    else bad "no repo"; fi
+    echo "${B}Timer${X}"
+    if [ "$OS" = "Darwin" ]; then
+        if launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then ok "launchd agent loaded (daily 03:30)"; else warn "not installed (run: tape install)"; fi
+    elif systemctl --user is-enabled lucys-tape-refresh.timer >/dev/null 2>&1; then
+        ok "enabled ($(systemctl --user is-active lucys-tape-refresh.timer))"
+        systemctl --user list-timers lucys-tape-refresh.timer --no-pager 2>/dev/null | awk 'NR==2{print "  next: "$1" "$2"  ·  last: "$4" "$5}'
+        local res; res="$(systemctl --user show -p Result --value lucys-tape-refresh.service 2>/dev/null)"
+        [ -n "$res" ] && ok "last run result: $res"
+    else warn "not installed (run: tape install)"; fi
+    echo "${B}Viewer${X}"
+    if pgrep -f conversations_viewer.py >/dev/null; then ok "running → http://127.0.0.1:${PORT}"; else warn "stopped (start: tape serve)"; fi
+    echo "${B}Disk${X}"
+    ok "archive fs: $(free_gb_of "$ARCHIVE")GB free  ·  $(du -sh "$ARCHIVE" 2>/dev/null | cut -f1) archive"
+    if [ -n "$BACKUP_DIR" ]; then
+        ok "backups: $(ls -1 "$BACKUP_DIR"/lucys-tape-archive-*.tar.gz 2>/dev/null | wc -l | tr -d ' ') snapshot(s) in $BACKUP_DIR"
+    else warn "TAPE_BACKUP_DIR unset (no durable backups)"; fi
+    echo "${B}Last log${X}"
+    [ -f "$LOG" ] && tail -1 "$LOG" | sed 's/^/  /' || warn "no log yet"
+}
+cmd_monitor() { cmd_status; }
+
+# ============================================================================
+cmd_stats() {
+    [ -f "$DB" ] || die "no archive DB — run: tape update"
+    python3 - "$DB" "$ARCHIVE" <<'PY'
+import sqlite3, sys, os, collections
+db, arch = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+n, = c.execute("SELECT COUNT(*) FROM conversations").fetchone()
+dlg, stp = c.execute("SELECT COALESCE(SUM(n_dialogue),0),COALESCE(SUM(n_steps),0) FROM conversations").fetchone()
+lo, hi = c.execute("SELECT MIN(started),MAX(started) FROM conversations").fetchone()
+B="\033[1m"; X="\033[0m"; G="\033[36m"
+print(f"{B}📼 Lucy's Tape — archive statistics{X}")
+print(f"  conversations : {B}{n}{X}")
+print(f"  dialogue turns: {dlg:,}   tool steps: {stp:,}")
+print(f"  span          : {(lo or '?')[:10]} → {(hi or '?')[:10]}")
+print(f"\n{B}By project (top 10){X}")
+for proj, k, t in c.execute("SELECT project,COUNT(*),SUM(n_dialogue) FROM conversations GROUP BY project ORDER BY 2 DESC LIMIT 10"):
+    print(f"  {k:5d}  {proj}  {G}({t:,} turns){X}")
+print(f"\n{B}By model{X}")
+mc = collections.Counter()
+for (m,) in c.execute("SELECT models FROM conversations"):
+    for x in [s.strip() for s in (m or '').split(',') if s.strip()]:
+        mc[x]+=1
+for m,k in mc.most_common():
+    print(f"  {k:5d}  {m}")
+rep = os.path.join(arch, "REDACTION-REPORT.txt")
+if os.path.exists(rep):
+    first = open(rep).readline().strip()
+    print(f"\n{B}Secrets{X}\n  {first}")
+PY
+}
+
+# ============================================================================
+cmd_logs() {
+    [ -f "$LOG" ] || { warn "no log yet (run: tape update)"; return 0; }
+    case "${1:-}" in
+        -f|--follow) tail -f "$LOG" ;;
+        sys|journal) journalctl --user -u lucys-tape-refresh.service --no-pager -n 50 2>/dev/null || warn "no journald entries" ;;
+        *) tail -n 40 "$LOG" ;;
+    esac
+}
+
+# ============================================================================
+cmd_doctor() {
+    say "${B}preflight checks${X}"
+    [ -d "$HOME/.claude/projects" ] && ok "sources: ~/.claude/projects present" || bad "sources missing (is Claude Code in use here?)"
+    [ -d "$REPO/.git" ] && ok "repo: $REPO" || bad "repo missing"
+    command -v python3 >/dev/null && ok "python3: $(python3 --version 2>&1)" || bad "python3 missing"
+    command -v git >/dev/null && ok "git: $(git --version | awk '{print $3}')" || bad "git missing"
+    local f; f="$(free_gb_of "$ARCHIVE")"
+    [ "${f:-0}" -ge "$MIN_FREE_GB" ] && ok "disk: ${f}GB free (≥ ${MIN_FREE_GB})" || bad "disk low: ${f}GB < ${MIN_FREE_GB}"
+    [ -n "$BACKUP_DIR" ] && { [ -d "$BACKUP_DIR" ] && ok "backup dir: $BACKUP_DIR" || warn "TAPE_BACKUP_DIR set but missing: $BACKUP_DIR"; } || warn "TAPE_BACKUP_DIR unset (durable backups skipped)"
+    [ -f "$DB" ] && ok "DB present: $(db_count) conversations" || warn "no DB yet (run: tape update)"
+    cd "$REPO" 2>/dev/null || return
+    local origin; origin="$(git remote get-url origin 2>/dev/null || true)"
+    if [ -z "$origin" ]; then
+        bad "no 'origin' remote — run: tape init"
+    elif echo "$origin" | grep -q "lucys-tape"; then
+        warn "origin still points at the public lucys-tape repo — your archive should push to YOUR private repo (run: tape init)"
+    else
+        ok "origin: $origin"
+    fi
+    git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 && ok "upstream set: $(git rev-parse --abbrev-ref '@{u}')" || warn "no upstream branch (first push sets it)"
+}
+
+# ============================================================================
+cmd_init() {
+    say "${B}📼 Lucy's Tape — first-time setup${X}"
+    echo "  Your AI wakes up every morning with no memory of yesterday."
+    echo "  Let's make it the tape.  (Ctrl-C anytime; re-run: tape init)"
+    echo
+    # 0. preconditions
+    [ -d "$HOME/.claude/projects" ] || die "~/.claude/projects not found — install/use Claude Code first, then come back"
+    command -v python3 >/dev/null || die "python3 is required (stdlib only — no pip installs)"
+    command -v git >/dev/null || die "git is required"
+
+    # 1. detach from the public repo: your conversations must NEVER push there.
+    cd "$REPO" || die "cannot cd to $REPO"
+    local origin; origin="$(git remote get-url origin 2>/dev/null || true)"
+    if echo "$origin" | grep -q "lucys-tape"; then
+        say "step 1 — your PRIVATE archive repo"
+        echo "  Your archive will be committed here and pushed to a repo YOU own."
+        echo "  Create a PRIVATE empty repo first (e.g. on GitHub: 'my-tape', Private, no README)."
+        printf "  Paste its git URL (or leave empty to stay local-only): "
+        local url; read -r url
+        git remote rename origin upstream 2>/dev/null && ok "public repo kept as 'upstream' (for tool updates)"
+        if [ -n "$url" ]; then
+            git remote add origin "$url" && ok "origin → $url"
+        else
+            warn "local-only mode: no pushes until you set one (git remote add origin <url>)"
+        fi
+    else
+        ok "origin already points at your own repo: ${origin:-'(none — local-only)'}"
+    fi
+
+    # 2. put `tape` on the PATH
+    say "step 2 — the 'tape' command"
+    local bin="$HOME/.local/bin"
+    mkdir -p "$bin"
+    ln -sf "$SELF" "$bin/tape" && ok "linked: $bin/tape"
+    case ":$PATH:" in
+        *":$bin:"*) : ;;
+        *) warn "$bin is not on your PATH — add:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+
+    # 3. first extraction
+    say "step 3 — first extraction (read-only on sources, secret-scrubbed)"
+    printf "  Run it now? [Y/n] "
+    local yn; read -r yn
+    if [ "${yn:-Y}" != "n" ] && [ "${yn:-Y}" != "N" ]; then
+        cmd_update || warn "first update had warnings — check: tape logs"
+    else
+        warn "skipped — run later with: tape update"
+    fi
+
+    # 4. daily timer
+    say "step 4 — the daily timer (this is what makes it a tape)"
+    printf "  Install it now? [Y/n] "
+    read -r yn
+    if [ "${yn:-Y}" != "n" ] && [ "${yn:-Y}" != "N" ]; then
+        cmd_install || true
+    else
+        warn "skipped — install later with: tape install"
+    fi
+
+    echo
+    say "${G}done.${X} Browse your archive:  ${B}tape serve${X}  → http://127.0.0.1:${PORT}"
+    say "Every day from now on, the tape rolls itself. 💜"
+}
+
+# ---- dispatch ----------------------------------------------------------------
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    init|setup)      cmd_init "$@" ;;
+    update|refresh)  cmd_update "$@" ;;
+    build)           cmd_build "$@" ;;
+    backup)          cmd_backup "$@" ;;
+    serve|view)      cmd_serve "$@" ;;
+    stop)            cmd_stop "$@" ;;
+    install)         cmd_install "$@" ;;
+    uninstall)       cmd_uninstall "$@" ;;
+    status|monitor)  cmd_status "$@" ;;
+    stats)           cmd_stats "$@" ;;
+    logs|log)        cmd_logs "$@" ;;
+    doctor|check)    cmd_doctor "$@" ;;
+    help|-h|--help)  cmd_help ;;
+    *) bad "unknown command: $cmd"; echo; cmd_help; exit 2 ;;
+esac

@@ -1,0 +1,7 @@
+# Build artifacts — the Markdown is the source of truth, the DB is disposable
+archive/conversations.db
+archive/conversations.db.gz
+archive/*.log
+__pycache__/
+*.pyc
+.DS_Store
