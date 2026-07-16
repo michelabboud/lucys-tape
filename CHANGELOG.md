@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1 — 2026-07-16 · security triage record
+
+- Verified the 2026-07-16 defensive bughunt against the current runtime code:
+  the report contains no Critical findings, and all four confirmed High findings
+  have explicit trigger or environment prerequisites.
+- Added Codex fix notes with confirmed-vs-refuted status, focused verification
+  evidence, remediation TODOs, and the secret-rotation assessment.
+- No runtime behavior or tests changed in this release: no finding met the
+  requested Critical or literal precondition-free High fix threshold.
+
 ## v0.1.0 — 2026-07-02 · the tape starts rolling
 
 First public release: the generalized machinery of the private Fabulous archive.
