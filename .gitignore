@@ -5,3 +5,4 @@ archive/*.log
 __pycache__/
 *.pyc
 .DS_Store
+/.codex-*.log
