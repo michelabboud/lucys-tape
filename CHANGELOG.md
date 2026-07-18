@@ -27,3 +27,15 @@ First public release: the generalized machinery of the private Fabulous archive.
 - One-line installer (install.sh); native-Windows guide (Task Scheduler path)
 - Tests: redactor contract (incl. guard-sync pin), extract→build round-trip,
   notes importer
+
+## [0.1.2] — 2026-07-18
+
+### Added
+- **Codex source (optional):** the tape now also archives OpenAI codex CLI sessions
+  (`~/.codex/sessions/**` rollout JSONL — never auth/sqlite/caches). Same pipeline:
+  every stored string passes the redactor; reasoning and tool outputs are not archived
+  (dialogue + step labels only, mirroring the Claude source); conversations carry
+  `engine:"codex"` in their sentinel. Machines without codex are unaffected.
+- 11 unit tests on synthetic rollout fixtures (secret redaction, wrapper stripping,
+  developer-role skip, no-outputs guarantee, generic project labeling).
+

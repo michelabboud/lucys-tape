@@ -9,6 +9,9 @@ Lucy's Tape is a self-hosted, secret-scrubbed, searchable archive of every
 nightly into plain Markdown, committed to your own private git repo, and browsable in a
 local web viewer. Ten minutes to set up. After that, you never lose a conversation again.
 
+> 📼 Since v0.1.2 the tape can also archive **OpenAI codex CLI** sessions
+> (`~/.codex/sessions`) alongside Claude Code — same redaction, same shelves, optional.
+
 ## Why "Lucy's Tape"?
 
 In the film *50 First Dates* (2004), Lucy has anterograde amnesia: every night her memory

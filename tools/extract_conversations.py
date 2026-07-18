@@ -24,6 +24,10 @@ from collections import Counter
 from pathlib import Path
 
 PROJECTS = Path.home() / ".claude" / "projects"
+# Optional second source: OpenAI codex CLI rollout sessions. Scope is STRICTLY
+# ~/.codex/sessions/** — never auth.json, sqlite stores, caches, or worktrees.
+# A machine without codex simply has no such dir and the tape skips it.
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "archive"
 CONV_DIR = OUT / "conversations"
 
@@ -201,10 +205,158 @@ def project_label(d):
     return d or "unknown"
 
 
+
+# ---- codex source (rollout JSONL) -------------------------------------------
+# Observed format (codex CLI 0.14x): typed JSONL — {"timestamp","type","payload"}
+# with session_meta (id, cwd, git{branch}), turn_context (per-turn `model`),
+# response_item (message | function_call | custom_tool_call | reasoning | ...),
+# event_msg (duplicate message stream + telemetry — skipped). Reasoning and tool
+# OUTPUTS are deliberately not archived, mirroring the Claude source. Everything
+# stored passes redact().
+
+CODEX_WRAPPER = re.compile(
+    r"<(environment_context|user_instructions|ENVIRONMENT_CONTEXT|permissions|INSTRUCTIONS)>.*?</\1>",
+    re.S)
+
+
+def codex_project_label(cwd):
+    """Shelf name for a codex session cwd — generic for ANY user (no hardcoded
+    usernames): the segment after a `projects` dir when present, else basename."""
+    if not cwd:
+        return "codex-misc"
+    parts = Path(cwd).parts
+    if "projects" in parts:
+        i = parts.index("projects")
+        if len(parts) > i + 1:
+            return parts[i + 1]
+    if str(Path(cwd)) == str(Path.home()):
+        return "home"
+    return Path(cwd).name or "codex-misc"
+
+
+def codex_step_label(name, arguments):
+    inp = {}
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                inp = parsed
+        except (json.JSONDecodeError, ValueError):
+            inp = {}
+    elif isinstance(arguments, dict):
+        inp = arguments
+    if name in ("shell", "exec_command", "local_shell"):
+        cmd = inp.get("command", "")
+        if isinstance(cmd, list):
+            cmd = " ".join(str(c) for c in cmd)
+        return f"Bash: {' '.join(str(cmd).split())[:120]}"
+    if name == "apply_patch":
+        return "apply_patch (edit)"
+    for k in ("path", "file_path", "pattern", "query", "url", "description", "prompt"):
+        if k in inp:
+            return f"{name}: {str(inp[k])[:90]}"
+    return name or "?"
+
+
+def codex_title(user_msgs, n=80):
+    for m in user_msgs or ():
+        t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m or "")).strip()
+        if t:
+            if len(t) > n:
+                cut = t[:n]
+                if " " in cut:
+                    cut = cut.rsplit(" ", 1)[0]
+                t = cut.rstrip(" ,.;:-")
+            return t
+    return None
+
+
+def parse_codex_session(path):
+    """Parse one codex rollout JSONL into the shared conversation meta shape."""
+    sid = path.stem
+    started = ended = None
+    models, branches = set(), set()
+    cwd = None
+    turns = []
+    u = a = steps = 0
+    cur_model = ""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = o.get("type")
+            p = o.get("payload")
+            if not isinstance(p, dict):
+                continue
+            ts = o.get("timestamp") or ""
+            if t == "session_meta":
+                sid = p.get("id") or p.get("session_id") or sid
+                cwd = p.get("cwd") or cwd
+                git = p.get("git")
+                if isinstance(git, dict) and git.get("branch"):
+                    branches.add(git["branch"])
+                started = started or p.get("timestamp") or ts
+            elif t == "turn_context":
+                if p.get("model"):
+                    cur_model = p["model"]
+                    models.add(cur_model)
+                if p.get("cwd"):
+                    cwd = cwd or p["cwd"]
+            elif t == "response_item":
+                pt = p.get("type")
+                if pt == "message":
+                    role = p.get("role")
+                    if role not in ("user", "assistant"):
+                        continue
+                    texts = []
+                    content = p.get("content")
+                    blocks = content if isinstance(content, list) else []
+                    for b in blocks:
+                        if isinstance(b, dict) and b.get("type") in ("input_text", "output_text"):
+                            texts.append(b.get("text") or "")
+                    text = "\n".join(x for x in texts if x).strip()
+                    if role == "user":
+                        text = CODEX_WRAPPER.sub("", text).strip()
+                    if not text:
+                        continue
+                    turns.append((role, "dialogue", ts,
+                                  cur_model if role == "assistant" else "", redact(text)))
+                    started = started or ts
+                    ended = ts or ended
+                    u += role == "user"
+                    a += role == "assistant"
+                elif pt in ("function_call", "custom_tool_call", "web_search_call",
+                            "tool_search_call", "image_generation_call"):
+                    label = codex_step_label(p.get("name", pt), p.get("arguments"))
+                    turns.append(("tool", "step", ts, cur_model, redact(label)))
+                    steps += 1
+                    started = started or ts
+                    ended = ts or ended
+    if not any(k == "dialogue" for _, k, _, _, _ in turns):
+        return None
+    user_msgs = [tx for (r, k, _ts, _m, tx) in turns if r == "user" and k == "dialogue"]
+    return {
+        "sid": sid, "engine": "codex",
+        "title": redact(codex_title(user_msgs) or "codex session"),
+        "project": codex_project_label(cwd),
+        "started": started or "", "ended": ended or "",
+        "models": ", ".join(sorted(models)), "branch": ", ".join(sorted(branches)),
+        "n_dialogue": u + a, "user_turns": u, "assistant_turns": a, "n_steps": steps,
+        "turns": turns, "chars": sum(len(x[4]) for x in turns),
+    }
+
+
 def write_markdown(meta, project, path):
     fab = {k: meta[k] for k in ("sid", "started", "ended", "models", "branch",
                                 "n_dialogue", "user_turns", "assistant_turns", "n_steps")}
     fab["project"] = project
+    if meta.get("engine"):          # absent = claude (back-compat)
+        fab["engine"] = meta["engine"]
     with open(path, "w", encoding="utf-8") as out:
         out.write(f"<!--fab {json.dumps(fab, separators=(',', ':'))}-->\n\n")
         out.write(f"# {meta['title']}\n\n| | |\n|---|---|\n")
@@ -225,11 +377,11 @@ def write_markdown(meta, project, path):
 
 
 def main():
-    if not PROJECTS.is_dir():
-        sys.exit(f"source dir not found: {PROJECTS} — is Claude Code installed and used on this machine?")
+    if not PROJECTS.is_dir() and not CODEX_SESSIONS.is_dir():
+        sys.exit(f"no sources found: {PROJECTS} (Claude Code) nor {CODEX_SESSIONS} (codex) — nothing to archive")
     CONV_DIR.mkdir(parents=True, exist_ok=True)
     seen, index, scanned, kept = {}, [], 0, 0
-    for proj_dir in sorted(p for p in PROJECTS.iterdir() if p.is_dir()):
+    for proj_dir in sorted(p for p in PROJECTS.iterdir() if p.is_dir()) if PROJECTS.is_dir() else []:
         files = list(proj_dir.rglob("*.jsonl"))
         if not files:
             continue
@@ -243,6 +395,25 @@ def main():
             if sid in seen and meta["chars"] <= seen[sid]:
                 continue
             seen[sid] = meta["chars"]
+            proj_out = CONV_DIR / label
+            proj_out.mkdir(parents=True, exist_ok=True)
+            date = (meta["started"] or "0000-00-00")[:10]
+            write_markdown(meta, label, proj_out / f"{date}__{slugify(meta['title'])}__{sid}.md")
+            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"],
+                          f"conversations/{label}/{date}__{slugify(meta['title'])}__{sid}.md"))
+            kept += 1
+    # ---- codex source (optional; same shelves, same pipeline) ----------------
+    if CODEX_SESSIONS.is_dir():
+        for f in sorted(CODEX_SESSIONS.rglob("rollout-*.jsonl")):
+            scanned += 1
+            meta = parse_codex_session(f)
+            if not meta:
+                continue
+            sid = meta["sid"]
+            if sid in seen and meta["chars"] <= seen[sid]:
+                continue
+            seen[sid] = meta["chars"]
+            label = meta["project"]
             proj_out = CONV_DIR / label
             proj_out.mkdir(parents=True, exist_ok=True)
             date = (meta["started"] or "0000-00-00")[:10]
