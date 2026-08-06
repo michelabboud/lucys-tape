@@ -57,7 +57,10 @@ conversations.
 - **Commits & pushes** the Markdown to *your* private repo on a **daily systemd timer**
   — with guardrails: disk floor, sanity ratchet (never commits a suspiciously shrunken
   archive), single-instance lock.
-- **Serves a local viewer** (`http://127.0.0.1:8124`, loopback only) with full-text
+- **Serves a local viewer** (`http://127.0.0.1:8124`, loopback only) — full-text
+  search with highlighted result snippets, light/dark themes, keyboard navigation
+  (`/`, `j`/`k`), and no network calls of any kind: no web fonts, no CDN, nothing
+  leaves the machine. Works with JavaScript disabled. Full-text
   search and two independent layers: 🧑 **Personal** (the human dialogue) and
   🏛️ **Architect** (the tool steps) — read your story, or your build log, or both.
 - **Markdown is the source of truth.** The SQLite/FTS database is a disposable build

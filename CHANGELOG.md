@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.2.0 — 2026-08-06 · the viewer, rebuilt
+
+The local viewer had no tests and four real defects. All four were reproduced by
+hand against the old code before anything was changed.
+
+### Fixed
+
+- **Ordinary punctuation crashed the search.** The search box was passed straight
+  to FTS5 `MATCH`, so typing `"`, `*`, `(`, or the bare word `AND` raised
+  `OperationalError` out of the request handler and killed the page. Input is now
+  parsed into always-valid FTS5: a `"quoted phrase"` is honoured as a phrase and
+  every other token is re-quoted as a literal, so `AND` searches for the *word*
+  people meant. A trailing `*` is preserved as a prefix search (`redact*`).
+- **Search hits often showed nothing highlighted.** FTS matches case-insensitively
+  but the highlighter did not, so a hit on `Fox` while searching `fox` rendered
+  with no mark at all.
+- **Highlighting corrupted HTML entities.** It ran over already-escaped text, so
+  searching `amp` rewrote `&amp;` into `&<mark>amp</mark>;`. Highlighting now runs
+  against the raw text and escapes around the matches.
+- **Conversations were listed twice.** `build_db` writes one FTS row per *kind*,
+  so a term appearing in both a message and a tool step matched twice and the
+  JOIN duplicated the conversation. De-duplicated on best rank.
+- **Paging past the end reported a false "Nothing matched".** `?q=fox&page=2` on a
+  40-result search returned zero rows with a total of 40, rendering an empty state
+  byte-for-byte identical to a genuine miss. The page is now clamped before the
+  slice.
+- **A broken or locked database produced a traceback into a dead socket** instead
+  of a page. It now renders a real error page with the reason and the fix.
+
+### Added
+
+- **Result snippets.** Search results show the matching text with the term
+  highlighted, so you can see *why* something matched. For an archive whose whole
+  purpose is "do you remember…?", this was the biggest gap in the tool.
+- **Pagination** with a real result count, replacing a silent `LIMIT 300` that
+  truncated without saying so.
+- **A light "paper" theme** alongside the dark one, remembered across visits.
+- **Keyboard**: `/` focuses search, `j`/`k` move through results, `Esc` unfocuses.
+- **Per-turn anchors** — every turn is linkable.
+- **Responsive layout.** Previously a fixed 340px rail in a `100vh` flex row, i.e.
+  unusable on a phone. Verified over 10 pages × 7 viewport widths, 0 failures —
+  with the detector itself checked against a deliberately overflowing control.
+- **Security headers**: a per-response CSP nonce, `nosniff`, `no-referrer`. See
+  [ADR 0004](docs/adr/0004-viewer-is-offline-first-and-csp-hardened.md).
+- **83 tests** where there were none, including the four defects above, XSS
+  through archived markup, and two mechanical guards described below.
+
+### Notes
+
+- **WCAG AA**: `--faint` (timestamps, result meta, counts — all 11.5px, i.e.
+  normal text) failed at 3.18–3.39:1 in dark and 3.28–3.63:1 in light. Retoned to
+  pass 4.5:1 on every surface it is used on. Measured, not eyeballed.
+- Two defects in this release were invisible to the test suite and found only by
+  opening a browser, so both now have mechanical guards:
+  **(a)** the CSP silently drops `style="…"` attributes — a nonce authorises a
+  `<style>` element, never a style attribute — which left every model badge
+  colourless while all tests passed;
+  **(b)** `fill=currentColor/>` parses the value as `currentColor/`, because HTML
+  ends an unquoted attribute value at whitespace or `>` and never at `/`. The
+  theme icon had correct geometry and painted nothing.
+
 ## v0.1.4 — 2026-08-06 · one unreadable source no longer costs you the archive
 
 ### Fixed

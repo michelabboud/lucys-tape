@@ -1,6 +1,9 @@
 # Progress
 
 ## Done
+- v0.2.0 — viewer rebuilt: search that cannot crash, result snippets, pagination,
+  light/dark themes, keyboard nav, responsive, CSP-hardened. Four pre-existing
+  defects fixed, two more found only by opening a browser. 0 → 83 tests. ADR 0004.
 - v0.1.4 — one unreadable source (dangling subagent symlink, deleted session) no
   longer aborts the whole refresh; skipped sources reported by path + reason.
   Found 2 live instances on the dev machine. 45 → 50 tests.
