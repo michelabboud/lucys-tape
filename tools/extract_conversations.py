@@ -90,6 +90,42 @@ REDACTIONS = [
     ("google_app_pw", re.compile(r"(?is)(\b(?:app|application)[ _-]?(?:password|secret|pw)\b.{0,60}?)\b[a-z]{4}[ -][a-z]{4}[ -][a-z]{4}[ -][a-z]{4}\b"), r"\1[REDACTED google-app-password]"),
 ]
 _red = Counter()
+_skipped = []   # (path, reason) for every source we could not read
+
+
+def safe_parse(parse, path):
+    """Parse one session file, surviving a source we cannot read.
+
+    The sources are outside our control and READ-ONLY to us, so we never repair
+    them: the CLI can delete a session mid-run, or leave a dangling subagent
+    symlink behind (rglob matches a symlink by name without resolving it, so the
+    read is where it fails). One such file must never cost the whole refresh —
+    it is recorded and skipped, and reported loudly at the end.
+
+    Only OSError is caught, deliberately: a malformed *source* is expected and
+    survivable, whereas a bug in our own parsing is not, and must still crash
+    rather than quietly drop conversations.
+
+    This stays fail-SOFT only because the pipeline fails CLOSED downstream: the
+    sanity floor and shrink ratchet in `tools/tape` refuse to commit an archive
+    whose conversation count collapses, so mass source loss still aborts the run.
+    """
+    try:
+        return parse(path)
+    except OSError as e:
+        _skipped.append((path, e.strerror or e.__class__.__name__))
+        return None
+
+
+def report_skipped():
+    """Print every source we could not read. A hole in the archive is never
+    allowed to pass silently — this lands in the refresh log (`tape logs`).
+
+    The count is printed even when it is zero: a metric that only appears on
+    failure gives no evidence that it is watching."""
+    print(f"sources skipped      : {len(_skipped)}")
+    for path, reason in _skipped:
+        print(f"  WARN unreadable source, skipped: {path} — {reason}")
 
 
 def redact(text):
@@ -407,7 +443,7 @@ def main():
         label = project_label(proj_dir.name)
         for f in files:
             scanned += 1
-            meta = parse_session(f)
+            meta = safe_parse(parse_session, f)
             if not meta:
                 continue
             sid = meta["sid"]
@@ -425,7 +461,7 @@ def main():
     if CODEX_SESSIONS.is_dir():
         for f in sorted(CODEX_SESSIONS.rglob("rollout-*.jsonl")):
             scanned += 1
-            meta = parse_codex_session(f)
+            meta = safe_parse(parse_codex_session, f)
             if not meta:
                 continue
             sid = meta["sid"]
@@ -458,6 +494,7 @@ def main():
     print(f"sessions scanned     : {scanned}")
     print(f"conversations written: {kept}")
     print(f"secret redactions    : {sum(_red.values())}")
+    report_skipped()
 
 
 if __name__ == "__main__":

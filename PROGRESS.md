@@ -1,6 +1,9 @@
 # Progress
 
 ## Done
+- v0.1.4 — one unreadable source (dangling subagent symlink, deleted session) no
+  longer aborts the whole refresh; skipped sources reported by path + reason.
+  Found 2 live instances on the dev machine. 45 → 50 tests.
 - v0.1.3 — Telegram bot tokens are scrubbed (they were not: a token inside a Bot API
   URL reached the archive verbatim). Guard clause added as a strict subset; the
   redactor/guard ordering rule written down as ADR 0003. 34 → 45 tests, every new

@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.1.4 — 2026-08-06 · one unreadable source no longer costs you the archive
+
+### Fixed
+
+- **A single unreadable session file aborted the entire refresh.** `parse_session()`
+  and `parse_codex_session()` were called bare, so the first `OSError` propagated out
+  of `main()` and the run produced nothing — including every healthy conversation
+  sitting beside the bad file.
+
+  This is not hypothetical. The most common trigger is a dangling subagent symlink:
+  `rglob("*.jsonl")` matches a symlink by *name* without resolving it, so the failure
+  lands at the read. A scan of this machine's live sources found **2** of them among
+  231 matches. Anyone whose archive silently stopped updating may have been hitting
+  exactly this.
+
+  Unreadable sources are now recorded and skipped, and reported by path and reason in
+  the refresh log (`tape logs`). Only `OSError` is caught, deliberately — a malformed
+  *source* is expected and survivable; a bug in our own parsing is not, and must still
+  crash rather than quietly drop conversations.
+
+  This stays fail-**soft** only because the pipeline already fails **closed**
+  downstream: the sanity floor and the shrink ratchet in `tools/tape` refuse to commit
+  an archive whose conversation count collapses, so mass source loss still aborts the
+  run instead of publishing a truncated archive.
+
+- The skipped-source count is printed **even when it is zero**. A metric that only
+  appears on failure offers no evidence that it is watching.
+
+### Added
+
+- 5 tests (45 → 50) covering the dangling symlink, an unreadable file (reason must be
+  named, not swallowed), the zero-skipped line on a clean run, healthy sessions
+  surviving a bad neighbour, and the codex source going through the same seam. All
+  five were watched fail first — 4 as errors (the crash) and 1 as a failure (the
+  missing metric).
+
 ## v0.1.3 — 2026-08-06 · Telegram bot tokens are scrubbed
 
 ### Security
