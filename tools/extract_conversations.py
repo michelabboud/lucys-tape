@@ -289,30 +289,183 @@ def codex_project_label(cwd):
     return Path(cwd).name or "codex-misc"
 
 
-def codex_step_label(name, arguments):
-    inp = {}
-    if isinstance(arguments, str):
+def _js_object_candidates(s):
+    """Every balanced {...} span in `s`, outermost-first, as raw text."""
+    out = []
+    start = s.find("{")
+    while start != -1 and len(out) < 8:
+        depth, in_str, esc, quote = 0, False, False, ""
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote:
+                    in_str = False
+                continue
+            if ch in '"\'':
+                in_str, quote = True, ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(s[start:i + 1])
+                    break
+        start = s.find("{", start + 1)
+    return out
+
+
+def _first_json_object(s):
+    """The first balanced {...} in `s` that parses as a JSON object, else None.
+
+    Needed because codex's `exec` tool does not hand over JSON at all — it hands
+    over JavaScript:
+
+        const r = await tools.exec_command({"cmd": "...", "workdir": "..."});
+
+    A brace scan (rather than a regex) is what keeps a command containing braces
+    or quotes — `awk '{print $1}'` — from truncating the object early.
+    """
+    start = s.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        parsed = json.loads(s[start:i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        break
+                    if isinstance(parsed, dict):
+                        return parsed
+                    break
+        start = s.find("{", start + 1)
+    return None
+
+
+# A bare JS identifier used as an object key: `{cmd:"…"}` rather than `{"cmd":"…"}`.
+# Legal JavaScript, illegal JSON, and the single most common `exec` payload shape.
+_JS_BARE_KEY = re.compile(r'([{,]\s*)([A-Za-z_$][\w$]*)\s*:')
+# The tool a sandbox script actually calls: `await tools.write_stdin({…})`.
+_JS_TOOL_CALL = re.compile(r"\btools\.([A-Za-z_$][\w$]*)\s*\(")
+
+
+def codex_args(payload):
+    """Best-effort dict from a codex tool payload (JSON, or JS wrapping JSON)."""
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, str) or not payload.strip():
+        return {}
+    try:
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    obj = _first_json_object(payload)
+    if obj is not None:
+        return obj
+    # Last resort: the object literal is JS, not JSON — quote its bare keys and
+    # retry. Gated behind the strict parses above, and a mangled result simply
+    # fails to parse and falls through to {}, so this can only ever recover.
+    for raw in _js_object_candidates(payload):
         try:
-            parsed = json.loads(arguments)
-            if isinstance(parsed, dict):
-                inp = parsed
+            parsed = json.loads(_JS_BARE_KEY.sub(r'\1"\2":', raw))
         except (json.JSONDecodeError, ValueError):
-            inp = {}
-    elif isinstance(arguments, dict):
-        inp = arguments
-    if name in ("shell", "exec_command", "local_shell"):
-        cmd = inp.get("command", "")
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def codex_inner_tool(payload):
+    """The tool a sandbox script calls, e.g. `write_stdin` — else None.
+
+    `exec` is a JavaScript sandbox, so the interesting name is usually the tool
+    invoked *inside* the script, not the sandbox itself. Naming it beats emitting
+    a bare "exec" that says nothing about what happened.
+    """
+    if not isinstance(payload, str):
+        return None
+    names = [n for n in _JS_TOOL_CALL.findall(payload) if n != "exec"]
+    return names[0] if names else None
+
+
+# Every codex tool name that means "run a shell command". `exec` is the current
+# one and was missing, which alone blanked 107,953 step labels in the archive.
+CODEX_SHELL_TOOLS = ("shell", "exec", "exec_command", "local_shell")
+
+# `exec` is a general JavaScript sandbox, not only a shell: roughly three quarters
+# of real `exec` calls are apply_patch envelopes rather than commands, and calling
+# those "Bash:" would swap one wrong label for another. The envelope names each
+# file it touches on its own directive line.
+CODEX_PATCH_FILE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.M)
+
+
+def codex_patch_label(payload):
+    """`apply_patch → <file>` for a patch envelope, else None.
+
+    Recognises the envelope wherever it appears in the payload — it arrives as a
+    JS string literal (`const patch = "*** Begin Patch\\n..."`), so the directive
+    lines are escaped and must be read after unescaping.
+    """
+    if not isinstance(payload, str) or "*** Begin Patch" not in payload:
+        return None
+    body = payload.replace("\\n", "\n").replace('\\"', '"')
+    files = [short_path(f.strip()) for f in CODEX_PATCH_FILE.findall(body)]
+    if not files:
+        return "apply_patch (edit)"
+    head = files[0]
+    return (f"apply_patch → {head}" if len(files) == 1
+            else f"apply_patch → {head} (+{len(files) - 1} more)")
+
+
+def codex_step_label(name, arguments):
+    """One-line label for a codex function/tool call (mirrors step_label)."""
+    inp = codex_args(arguments)
+    patch = codex_patch_label(arguments)
+    if patch:
+        return patch
+    if name in CODEX_SHELL_TOOLS:
+        # codex names the key `cmd`; `command` is the Claude-side spelling. Reading
+        # only `command` is why calls whose arguments WERE valid JSON still
+        # rendered as an empty "Bash: " — 66,139 of them.
+        cmd = inp.get("cmd") or inp.get("command") or ""
         if isinstance(cmd, list):
             cmd = " ".join(str(c) for c in cmd)
-        return f"Bash: {' '.join(str(cmd).split())[:120]}"
+        cmd = " ".join(str(cmd).split())[:120]
+        if cmd:
+            return f"Bash: {cmd}"
+        # Never emit a bare "Bash:" — a label with nothing after the colon reads
+        # as a step that ran an empty command, which is a lie about the record.
+        # Name the tool the sandbox script actually called, if it called one.
+        inner = codex_inner_tool(arguments)
+        if inner:
+            return f"{name} → tools.{inner}"
+        return name or "?"
     if name == "apply_patch":
         return "apply_patch (edit)"
     for k in ("path", "file_path", "pattern", "query", "url", "description", "prompt"):
         if k in inp:
             return f"{name}: {str(inp[k])[:90]}"
     return name or "?"
-
-
 def codex_title(user_msgs, n=80):
     for m in user_msgs or ():
         t = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m or "")).strip()
@@ -387,7 +540,11 @@ def parse_codex_session(path):
                     a += role == "assistant"
                 elif pt in ("function_call", "custom_tool_call", "web_search_call",
                             "tool_search_call", "image_generation_call"):
-                    label = codex_step_label(p.get("name", pt), p.get("arguments"))
+                    # `arguments` for function_call, `input` for custom_tool_call —
+                    # the `exec` tool uses the latter, and reading only `arguments`
+                    # is why it arrived as None and labelled itself "exec".
+                    label = codex_step_label(p.get("name", pt),
+                                             p.get("arguments") or p.get("input"))
                     turns.append(("tool", "step", ts, cur_model, redact(label)))
                     steps += 1
                     started = started or ts

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.2.2 — 2026-08-06 · codex tool steps carry their command again
+
+### Fixed
+
+- **Codex shell steps were archived as a bare tool name, losing the command.**
+  Measured on a real archive: 174,092 of 525,768 step turns — **33% of the whole
+  Architect layer** — rendered as `exec` or an empty `Bash:`, and every one came
+  from a codex model. The command was never missing from the source and was never
+  filtered by the viewer; the extractor dropped it on the way in. Three causes:
+
+  1. `exec` carries its payload in `input`, not `arguments`, and the call site read
+     only `arguments` — so it arrived as `None`.
+  2. That payload is **JavaScript, not JSON** —
+     `const r = await tools.exec_command({cmd:"…"})` — often with *unquoted* object
+     keys, which `json.loads` cannot parse either way.
+  3. codex names the key `cmd`; the labeller read `command`. So even calls whose
+     arguments *were* valid JSON produced an empty `Bash: `.
+
+  Recovery on real rollouts: **0.01% → 98%** informative labels (7,347/7,441).
+
+- `exec` is a general JS sandbox, not only a shell. Roughly a sixth of its calls are
+  `apply_patch` envelopes, now labelled `apply_patch → <file> (+N more)` rather than
+  mislabelled as a command; calls that drive another tool are named
+  `exec → tools.<name>`. A shell step whose command genuinely cannot be recovered
+  now degrades to the tool name — never a bare `Bash:`, which reads as a step that
+  ran an empty command.
+
+### Notes
+
+- This surfaces command text that was previously absent from the archive, so the
+  redactor now sees it. Verified: 13,907 recovered labels from real rollouts, **0**
+  trip the leak guard after redaction — and the scan was itself controlled with a
+  synthetic key, which it caught before redaction and lost after.
+- **Existing archives are not rewritten.** Labels are produced at extraction time;
+  re-run `tape update` to backfill.
+
+
 ## v0.2.1 — 2026-08-06 · two defects v0.2.0 shipped
 
 Both were found by serving the viewer against a **real** archive (8,936
