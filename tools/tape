@@ -32,7 +32,7 @@ KEEP_BACKUPS="${TAPE_KEEP_BACKUPS:-8}"
 SANITY_MIN="${TAPE_SANITY_MIN:-1}"
 FORCE_DB_DAILY="${TAPE_FORCE_DB_DAILY:-0}"
 BACKUP_DIR="${TAPE_BACKUP_DIR:-}"
-LEAK_RX='sk-ant-[A-Za-z0-9]{15}|\bsk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+LEAK_RX='sk-ant-[A-Za-z0-9]{15}|\bsk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[0-9]{8,}:[A-Za-z0-9_-]{35}'
 
 # ---- pretty output -----------------------------------------------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then

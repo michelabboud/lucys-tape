@@ -35,8 +35,12 @@ archive/INDEX.md · archive/REDACTION-REPORT.txt                  (committed, di
    diffable text. Any clone reconstructs the DB with `tape build`, no `~/.claude` needed.
 3. **The redactor filters; the leak guard verifies.** Two independent nets with one
    contract: the redactor's pattern set is a superset of the guard's (`tests/test_redact.py::
-   test_guard_regex_in_sync` pins it). The guard masks residuals instead of aborting —
+   test_guard_regex_in_sync` pins the mirror, `::test_redactor_is_a_superset_of_the_guard`
+   pins the property). The guard masks residuals instead of aborting —
    a stuck pipeline protects nobody — then fail-closes if masking itself failed.
+   The ordering rule for adding a new secret family — redactor first and broader,
+   guard second and narrower, never a trailing `\b` — is
+   [ADR 0003](docs/adr/0003-leak-guard-is-a-subset-of-the-redactor.md).
 4. **Round-trip losslessness.** Each turn carries a sentinel comment
    (`<!--t role=… kind=… model=… ts=…-->`); `write_markdown → parse_md` is lossless
    (`tests/test_roundtrip.py` pins it).

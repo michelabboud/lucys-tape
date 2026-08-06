@@ -50,7 +50,8 @@ conversations.
   Markdown file per conversation — dialogue, tool steps, per-turn model attribution —
   **read-only on the sources**, byte-verified, deterministic, zero model cost.
 - **Scrubs secrets** on the way through: API keys, PEM blocks (including truncated
-  pastes), JWTs, connection-string passwords, cloud credentials, app passwords, and
+  pastes), JWTs, connection-string passwords, cloud credentials, app passwords,
+  Telegram bot tokens (including the ones embedded in every Bot API URL), and
   more. A second, independent **leak guard** masks anything the redactor missed before
   any commit. Over-redaction beats any leak.
 - **Commits & pushes** the Markdown to *your* private repo on a **daily systemd timer**

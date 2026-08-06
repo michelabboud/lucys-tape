@@ -58,6 +58,25 @@ REDACTIONS = [
     ("aws_akid", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED aws-key-id]"),
     ("google_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "[REDACTED google-key]"),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED slack-token]"),
+    # Telegram bot tokens: <bot_id>:<35-char secret>. Two patterns, because the
+    # token appears in two shapes and one regex cannot catch both:
+    #   1. embedded in EVERY Bot API request URL — https://api.telegram.org/bot<token>/getMe
+    #      — where the digits follow "bot" with NO word boundary, so a \b-anchored
+    #      pattern silently misses the single most common way it leaks (an HTTP
+    #      client putting the failing URL into an error message, which then gets
+    #      archived verbatim from the terminal).
+    #   2. bare, pasted into prose or a config line.
+    # The URL form requires digits-then-colon after "/bot", which is what leaves
+    # Telegram's own docs URL (core.telegram.org/bots/api) intact — it is printed
+    # constantly and mangling it would corrupt readable prose for no gain.
+    # NEITHER is \b-anchored at the tail, deliberately: a trailing \b is exactly
+    # what made `openai_key` miss what the guard caught (see the note above), and
+    # the redactor must stay a SUPERSET of LEAK_RX or the push pipeline deadlocks.
+    # The marker is space-free so `assignment`/`env_named` can still collapse a
+    # NAME=<token> line to a single [REDACTED] instead of matching only up to the
+    # space and leaving "telegram-bot-token]" dangling in the output.
+    ("telegram_bot_url", re.compile(r"(?i)(/bot)\d{5,}:[A-Za-z0-9_\-]{30,}"), r"\1[REDACTED-telegram-bot-token]"),
+    ("telegram_bot_token", re.compile(r"\d{5,}:[A-Za-z0-9_\-]{30,}"), "[REDACTED-telegram-bot-token]"),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"), "[REDACTED jwt]"),
     ("bearer", re.compile(r"(?i)\b(bearer|authorization:?\s*bearer)\s+[A-Za-z0-9._\-]{20,}"), "[REDACTED bearer-token]"),
     ("conn_string_pw", re.compile(r"\b((?:postgres|postgresql|mysql|mongodb|redis|amqp)://[^:/\s]+:)[^@/\s]+(@)"), r"\1[REDACTED-PW]\2"),
