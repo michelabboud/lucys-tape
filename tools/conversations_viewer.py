@@ -460,10 +460,14 @@ def search(con, q, project, page):
     # requested context". So the de-duplication happens in Python instead, which
     # also keeps this working on whatever SQLite a user's Python happens to bundle
     # rather than depending on optimizer behaviour or a MATERIALIZED CTE.
-    sql = ("SELECT f.session_id AS sid, snippet(fts, 4, ?, ?, '…', 14) AS snip "
-           "FROM fts f JOIN conversations c ON c.session_id = f.session_id "
-           "WHERE fts MATCH ?")
-    args = [HL_OPEN, HL_CLOSE, match]
+    # PHASE 1 — rank and de-duplicate ids only. Deliberately NO snippet() here.
+    # snippet() is expensive and computing it for every match just to throw all
+    # but one page away is quadratic misery on a real archive: measured 217.8s
+    # for q="the" over 8,936 conversations (~18k matching FTS rows), against
+    # 0.5s for a rare term. Ids alone are cheap.
+    sql = ("SELECT f.session_id AS sid FROM fts f "
+           "JOIN conversations c ON c.session_id = f.session_id WHERE fts MATCH ?")
+    args = [match]
     if project:
         sql += " AND c.project = ?"
         args.append(project)
@@ -478,22 +482,32 @@ def search(con, q, project, page):
 
     # build_db writes one FTS row per KIND, so a term present in both a message
     # and a tool step matches twice. Rows arrive best-ranked first and dict
-    # preserves insertion order, so setdefault keeps the better snippet.
-    best = {}
+    # preserves insertion order, so this keeps each conversation at its best rank.
+    seen = {}
     for h in hits:
-        best.setdefault(h["sid"], h["snip"])
+        seen.setdefault(h["sid"], None)
 
-    sids = list(best)
+    sids = list(seen)
     total = len(sids)
     page = clamp_page(page, total)
     offset = (page - 1) * PAGE_SIZE
     window = sids[offset:offset + PAGE_SIZE]
     if not window:
         return [], total, page
+
+    # PHASE 2 — snippets for THIS PAGE only: at most PAGE_SIZE conversations, so
+    # at most 2*PAGE_SIZE rows regardless of how many matched overall.
     placeholders = ",".join("?" * len(window))
+    best = {}
+    for r in con.execute(
+            f"SELECT session_id AS sid, snippet(fts, 4, ?, ?, '…', 14) AS snip "
+            f"FROM fts WHERE fts MATCH ? AND session_id IN ({placeholders}) ORDER BY rank",
+            [HL_OPEN, HL_CLOSE, match] + window):
+        best.setdefault(r["sid"], r["snip"])
+
     by_id = {r["session_id"]: r for r in con.execute(
         f"SELECT * FROM conversations WHERE session_id IN ({placeholders})", window)}
-    return [dict(by_id[s], snip=best[s]) for s in window if s in by_id], total, page
+    return [dict(by_id[s], snip=best.get(s)) for s in window if s in by_id], total, page
 
 
 def sidebar(con, q="", project="", page=1, active=""):
@@ -696,7 +710,7 @@ class H(BaseHTTPRequestHandler):
                        f'<span class=tag>📁 {html.escape(r["project"])}</span>'
                        f'<span class=tag>📅 {(r["started"] or "")[:16].replace("T", " ")}</span>'
                        f'<span class=tag>🤖 {html.escape(r["models"] or "?")}</span>'
-                       + (f'<span class=tag>🌿 {html.escape(r["branch"])}</span>' if r["branch"] else "")
+                       + (f'<span class=tag>🌿 {html.escape(r["git_branch"])}</span>' if r["git_branch"] else "")
                        + '</div></header>')
                 body = (f'<div class=wrap>{sidebar(con, q, project, page_no, active=sid)}'
                         f'<main class=main id=main>{hdr}{tg}'

@@ -28,13 +28,26 @@ from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
 
-SCHEMA = """
-CREATE TABLE conversations (session_id TEXT PRIMARY KEY, project TEXT, title TEXT,
-  started TEXT, ended TEXT, models TEXT, branch TEXT, n_dialogue INT, user_turns INT,
-  assistant_turns INT, n_steps INT, engine TEXT);
-CREATE TABLE turns (session_id TEXT, idx INT, role TEXT, kind TEXT, ts TEXT, model TEXT, text TEXT);
-CREATE VIRTUAL TABLE fts USING fts5(session_id UNINDEXED, kind UNINDEXED, project, title, body);
-"""
+def real_schema():
+    """The PRODUCTION schema, extracted from build_db.py — never restated here.
+
+    Hand-writing a fixture schema is how a viewer suite passes against a shape the
+    real database does not have. This file previously invented `branch` and
+    `engine`; production has `git_branch` and `md_path`. A 12-value positional
+    INSERT swallowed the mismatch, so every conversation page raised
+    `IndexError: No item with that key` in production while every test was green.
+    Deriving the schema from the builder makes that class of drift impossible.
+    """
+    src = (TOOLS / "build_db.py").read_text(encoding="utf-8")
+    stmts = re.findall(r"CREATE (?:VIRTUAL )?TABLE [^;]+;", src)
+    assert len(stmts) >= 3, f"could not extract schema from build_db.py (found {len(stmts)})"
+    return "\n".join(stmts)
+
+
+SCHEMA = real_schema()
+
+CONV_COLS = ("session_id", "project", "title", "started", "ended", "n_dialogue",
+             "user_turns", "assistant_turns", "n_steps", "models", "git_branch", "md_path")
 
 
 def load_viewer(archive_dir):
@@ -65,9 +78,11 @@ def make_archive(conversations):
     for sid, project, title, turns in conversations:
         dialogue = [t for t in turns if t[1] in ("dialogue", "note")]
         steps = [t for t in turns if t[1] == "step"]
-        con.execute("INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (sid, project, title, "2026-08-06T09:00:00Z", "2026-08-06T09:30:00Z",
-                     "claude-opus-5", "main", len(dialogue), 1, 1, len(steps), None))
+        con.execute(
+            f"INSERT INTO conversations ({','.join(CONV_COLS)}) "
+            f"VALUES ({','.join('?' * len(CONV_COLS))})",
+            (sid, project, title, "2026-08-06T09:00:00Z", "2026-08-06T09:30:00Z",
+             len(dialogue), 1, 1, len(steps), "claude-opus-5", "main", f"{project}/{sid}.md"))
         for i, (role, kind, text) in enumerate(turns):
             con.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?)",
                         (sid, i, role, kind, "2026-08-06T09:0%d:00Z" % min(i, 9),

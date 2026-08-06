@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.1 — 2026-08-06 · two defects v0.2.0 shipped
+
+Both were found by serving the viewer against a **real** archive (8,936
+conversations, 1.05M turns) rather than a test fixture. Neither was visible to the
+83-test suite, because the suite was the problem in one case.
+
+### Fixed
+
+- **Every conversation page raised `IndexError` and returned an empty reply.** The
+  header read `r["branch"]`; the column produced by `build_db.py` is `git_branch`.
+  The tests did not catch it because `tests/test_viewer.py` **hand-wrote its own
+  fixture schema**, inventing `branch` and `engine` while production has
+  `git_branch` and `md_path` — and a 12-value positional `INSERT` swallowed the
+  mismatch. The fixture now **derives the schema from `build_db.py`**, so it cannot
+  drift again; re-introducing the bug against the corrected fixture fails 5 tests.
+- **Search was quadratic on a real archive.** `snippet()` was computed for every
+  matching FTS row before all but one page was discarded. Measured on 8,936
+  conversations: a common word (`the`, ~18k matching rows) took **217.8s**. Ranking
+  is now done on ids alone and snippets are computed for the current page only.
+
+  ```
+  query        before      after
+  the         217.82s      1.93s     (113x)
+  fox           6.43s      0.17s      (38x)
+  redaction     0.51s      0.07s       (7x)
+  ```
+
+
 ## v0.2.0 — 2026-08-06 · the viewer, rebuilt
 
 The local viewer had no tests and four real defects. All four were reproduced by
