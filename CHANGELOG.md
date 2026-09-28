@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.12 — 2026-09-28 · the database is built from the verified Markdown, and never lost
+
+### Security
+
+- **LT-SEC-001: the search database kept secrets the leak guard had masked.** The update built
+  `conversations.db` before the masker ran, so anything the guard masked in the Markdown stayed
+  searchable in the database, and from there went into durable backups and the weekly release
+  snapshot. The update now extracts, masks, verifies, and only then builds the database from
+  the final Markdown.
+  Shown by a test: a key in a session's git branch name (a field the redactor does not yet
+  cover; fixed at the source in a later task) was masked in the Markdown but kept in the database.
+
+### Fixed
+
+- **LT-SEC-015: a failed or suspicious rebuild destroyed the last good database.** It was
+  rebuilt in place. `build_db.py` now writes a temporary file and swaps it in atomically, and
+  the update builds to a side file, checks the conversation count on it (the sanity floor and
+  the shrink ratchet), and only then replaces the database; a refused rebuild keeps the old one.
+
 ## v0.2.11 — 2026-09-28 · the destination check's review findings
 
 ### Fixed

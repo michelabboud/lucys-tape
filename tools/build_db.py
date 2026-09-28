@@ -9,6 +9,7 @@ It works on any clone of the repo with NO access to ~/.claude: the Markdown
 alone fully reconstructs the database. Run via `tape build`.
 """
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -16,7 +17,10 @@ from pathlib import Path
 
 ARCHIVE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "archive"
 CONV_DIR = ARCHIVE / "conversations"
-DB_PATH = ARCHIVE / "conversations.db"
+# Optional second argument: where to write the DB (tools/tape builds to a side file,
+# checks it, then swaps it in). Either way the build goes to a temporary file first and
+# replaces the target atomically, so a crash never leaves a half-built or missing DB.
+DB_PATH = Path(sys.argv[2]) if len(sys.argv) > 2 else ARCHIVE / "conversations.db"
 
 FAB = re.compile(r"^<!--fab (\{.*\})-->\s*$")
 TURN = re.compile(r"^<!--t role=(\S+) kind=(\S+) model=(\S*) ts=(\S*)-->\s*$")
@@ -82,7 +86,19 @@ def main():
     if not CONV_DIR.exists():
         print(f"No conversations at {CONV_DIR}. Run extract first.")
         sys.exit(1)
-    con = sqlite3.connect(DB_PATH)
+    tmp = DB_PATH.with_name(f"{DB_PATH.name}.tmp-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    try:
+        n = build(tmp)
+        os.replace(tmp, DB_PATH)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    print(f"built {DB_PATH} from {n} conversations")
+
+
+def build(db_path):
+    con = sqlite3.connect(db_path)
     init_db(con)
     n = 0
     for md in sorted(CONV_DIR.rglob("*.md")):
@@ -107,7 +123,7 @@ def main():
         n += 1
     con.commit()
     con.close()
-    print(f"built {DB_PATH} from {n} conversations")
+    return n
 
 
 if __name__ == "__main__":

@@ -110,7 +110,7 @@ die()  { bad "$*"; log "FATAL: $*"; exit 1; }
 
 # Portable free-GB (GNU df's --output is Linux-only; shutil works everywhere).
 free_gb_of() { python3 -c 'import shutil,sys;print(shutil.disk_usage(sys.argv[1]).free // 2**30)' "$1" 2>/dev/null; }
-db_count()   { python3 - "$DB" <<'PY' 2>/dev/null
+db_count()   { python3 - "${1:-$DB}" <<'PY' 2>/dev/null
 import sqlite3, sys
 try: print(sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
 except Exception: print(0)
@@ -358,15 +358,6 @@ cmd_update() {
     # 1. sources -> Markdown (the committed source of truth)
     say "extracting (read-only on sources)…"
     python3 "$EXTRACT" "$ARCHIVE" >>"$LOG" 2>&1 || die "extractor failed (see: tape logs)"
-    # 2. Markdown -> DB (a local build artifact, git-ignored)
-    python3 "$BUILD" "$ARCHIVE" >>"$LOG" 2>&1 || die "DB build failed (see: tape logs)"
-    local count; count="$(db_count)"
-    [ "${count:-0}" -ge "$SANITY_MIN" ] || die "only ${count} conversations (< ${SANITY_MIN}) — looks broken; NOT committing"
-    if [ "${prev_count:-0}" -gt 10 ] && [ "$count" -lt $((prev_count / 2)) ]; then
-        die "archive shrank ${prev_count} → ${count} (more than half) — looks broken; NOT committing"
-    fi
-    ok "extracted + built ${count} conversations"; log "built ${count}"
-
     # leak guard: MASK residual secrets in place (never abort) — then commit clean output.
     say "leak guard: masking any residual secrets the redactor missed…"
     local mask_out mf mh
@@ -383,6 +374,23 @@ cmd_update() {
         die "leak guard: pattern STILL present after masking — refusing to commit (investigate the masker)"
     fi
     ok "leak guard passed (output verified clean)"
+
+    # 2. verified Markdown -> DB (a local build artifact, git-ignored). Built only now,
+    # from the masked and verified Markdown (LT-SEC-001: built before masking, the DB,
+    # backups and release snapshots kept what the guard masked), into a NEW file that
+    # replaces the old one only after it passes the sanity checks, so a failed or
+    # suspicious rebuild leaves the last good DB in place (LT-SEC-015).
+    local next="$DB.next"
+    python3 "$BUILD" "$ARCHIVE" "$next" >>"$LOG" 2>&1 || { rm -f "$next"; die "DB build failed (see: tape logs)"; }
+    local count; count="$(db_count "$next")"
+    if [ "${count:-0}" -lt "$SANITY_MIN" ]; then
+        rm -f "$next"; die "only ${count} conversations (< ${SANITY_MIN}) — looks broken; NOT committing (previous DB kept)"
+    fi
+    if [ "${prev_count:-0}" -gt 10 ] && [ "$count" -lt $((prev_count / 2)) ]; then
+        rm -f "$next"; die "archive shrank ${prev_count} → ${count} (more than half) — looks broken; NOT committing (previous DB kept)"
+    fi
+    mv -f "$next" "$DB" || die "could not replace the DB"
+    ok "extracted + built ${count} conversations"; log "built ${count}"
 
     # 3. commit ONLY the archive's own output (LT-SEC-003). The commit is built in a
     # private index and written with commit-tree + update-ref: the user's staging area

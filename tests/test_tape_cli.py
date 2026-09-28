@@ -90,6 +90,41 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertTrue(all(p in ("archive/INDEX.md", "archive/REDACTION-REPORT.txt") or
                             (p.startswith("archive/conversations/") and p.endswith(".md")) for p in new), new)
 
+    def db_text(self):
+        import sqlite3
+        con = sqlite3.connect(self.repo / "archive" / "conversations.db")
+        rows = con.execute("SELECT * FROM conversations").fetchall() + con.execute("SELECT * FROM turns").fetchall()
+        con.close()
+        return repr(rows)
+
+    def test_the_db_is_built_from_the_masked_markdown(self):
+        # A secret in a field the redactor does not see (the git branch, LT-SEC-005)
+        # is masked in the Markdown by the guard; the DB must hold the masked text too.
+        d = self.home / ".claude" / "projects" / "-home-u-proj"
+        recs = [{"type": "user", "sessionId": "hhhh-8888", "timestamp": "2026-09-01T10:00:00Z", "cwd": "/home/u/proj",
+                 "gitBranch": "sk-proj-" + "B" * 30, "message": {"role": "user", "content": "hi"}},
+                {"type": "assistant", "sessionId": "hhhh-8888", "timestamp": "2026-09-01T10:00:05Z",
+                 "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": "ok"}]}}]
+        (d / "hhhh-8888.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        r = self.update()
+        self.assertIn("guard masked", r.stdout)
+        self.assertNotIn("B" * 30, self.db_text())
+
+    def test_a_suspicious_rebuild_keeps_the_last_good_db(self):
+        for i in range(12):
+            self.add_session("-home-u-proj", f"keep-{i:04d}", f"conversation {i}")
+        self.assertEqual(self.update().returncode, 0)
+        before = self.db_text()
+        shutil.rmtree(self.home / ".claude" / "projects")
+        (self.home / ".claude" / "projects").mkdir()
+        for p in (self.repo / "archive" / "conversations").rglob("*.md"):
+            p.unlink()
+        r = self.update()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("previous DB kept", r.stdout)
+        self.assertEqual(self.db_text(), before)
+        self.assertFalse(list((self.repo / "archive").glob("conversations.db.*")))
+
     def test_low_disk_refusal_stops_the_update(self):
         self.env["TAPE_MIN_FREE_GB"] = "999999999"
         head = self.git("rev-parse", "HEAD")
