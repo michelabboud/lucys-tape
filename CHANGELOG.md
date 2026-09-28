@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2.22 — 2026-09-28 · containment, after its review
+
+Fixes from the deep review of 0.2.21 (and the confirm pass on 0.2.20).
+
+### Fixed
+
+- **A run killed mid-write could stop every later refresh.** 0.2.21 named its temporary files
+  `.<name>.<pid>.tmp`; when a later run reused that process id, creating the file failed every
+  night. The names are now random. A leftover file is excluded from the weekly backup and never
+  committed; it stays until you remove it.
+- Two writers creating the same folder at once (the notes importer runs outside the refresh
+  lock) no longer crash the second one.
+- The notes importer checks a file's size before reading it, and skips a capture larger than
+  50 MB instead of loading it into memory.
+
+### Security
+
+- A connection that has not shown the session cookie now gets 5 seconds, not 30. A local
+  process can still occupy the viewer's 16 slots by reconnecting, but it has to keep doing so
+  every 5 seconds; that is accepted as local denial of service, not a data exposure.
+- The redirect after the key also strips a leading backslash (`/\host` means `//host` to
+  browsers). It needs the key, so this was not exploitable.
+
+### Notes
+
+- A hard link inside a source folder, or a folder swapped mid-run by one of your own processes,
+  can still point a read elsewhere; only your own account can do either, and the result lands in
+  your private, redacted archive. Accepted.
+
 ## v0.2.21 — 2026-09-28 · every file stays in its folder
 
 ### Security

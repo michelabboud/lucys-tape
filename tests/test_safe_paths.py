@@ -158,6 +158,14 @@ class WriteTextTests(Tmp):
             sp.write_text(self.root / ".." / "outside.txt", "x", self.root)
         self.assertEqual(self.outside.read_text(), "precious, not ours\n")
 
+    def test_a_temp_file_left_by_a_killed_run_does_not_block_the_next(self):
+        # 0.2.21 named it .<name>.<pid>.tmp; a reused pid made every later write fail
+        for pid in (os.getpid(), 1, 99999):
+            (self.root / f".x.md.{pid}.tmp").write_text("left behind")
+        sp.write_text(self.root / "x.md", "fine", self.root)
+        self.assertEqual((self.root / "x.md").read_text(), "fine")
+        self.assertNotEqual(sp.temp_name("x.md"), sp.temp_name("x.md"))
+
     def test_a_failed_write_leaves_no_temporary_file(self):
         (self.root / "x.md").mkdir()  # a folder where the file should go: the rename fails
         with self.assertRaises(OSError):
@@ -239,6 +247,14 @@ class ExtractorContainmentTests(Tmp):
 
 @unittest.skipUnless(POSIX, "symlinks")
 class ImporterContainmentTests(Tmp):
+    def test_an_oversized_note_is_skipped_before_it_is_read(self):
+        (self.root / "huge.txt").write_text("x" * 5000)
+        mod = load("import_notes", [str(self.root), str(self.tmp / "archive")])
+        mod.MAX_BYTES = 1000
+        kept, skipped = mod.load_candidates(self.root)
+        self.assertEqual(kept, [])
+        self.assertIn("too large", skipped[0][1])
+
     def test_a_note_link_leading_outside_is_refused(self):
         notes = self.root
         (notes / "real.txt").write_text("A real saved conversation. " * 20)

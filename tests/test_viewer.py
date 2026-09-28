@@ -481,6 +481,22 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(r.getheader("Location").startswith("/"))
         self.assertFalse(r.getheader("Location").startswith("//"))
 
+    def test_a_backslash_redirect_stays_on_this_site(self):
+        code, r, _ = self._raw(f"/\\evil.example/x?key={self.v.ACCESS_KEY}", {})
+        self.assertEqual(code, 303)
+        self.assertFalse(r.getheader("Location").startswith(("//", "/\\")), r.getheader("Location"))
+
+    def test_the_user_gets_the_full_time_once_the_cookie_is_shown(self):
+        seen = []
+        real = self.srv.arm
+        self.srv.arm = lambda req, s: (seen.append(s), real(req, s))
+        try:
+            self.assertEqual(self.get("/")[0], 200)
+            self.assertEqual(self.get("/", cookie=False)[0], 401)
+        finally:
+            self.srv.arm = real
+        self.assertEqual(seen, [self.v.UNAUTH_TIMEOUT_S, self.v.REQUEST_TIMEOUT_S, self.v.UNAUTH_TIMEOUT_S])
+
     def _raw(self, path, headers):
         import http.client
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -505,8 +521,8 @@ class HttpTests(unittest.TestCase):
         # one byte just inside the per-read timeout used to hold a slot for ever
         import socket
         import time
-        saved = self.v.REQUEST_TIMEOUT_S
-        self.v.REQUEST_TIMEOUT_S = 1
+        saved = self.v.UNAUTH_TIMEOUT_S
+        self.v.UNAUTH_TIMEOUT_S = 1
         try:
             s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
             start = time.monotonic()
@@ -530,7 +546,7 @@ class HttpTests(unittest.TestCase):
             elapsed = time.monotonic() - start
             s.close()
         finally:
-            self.v.REQUEST_TIMEOUT_S = saved
+            self.v.UNAUTH_TIMEOUT_S = saved
         self.assertTrue(closed, "the connection was never cut")
         self.assertLess(elapsed, 3)
 

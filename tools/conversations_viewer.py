@@ -53,6 +53,9 @@ COOKIE = f"lt_session_{PORT}"
 MAX_QUERY_CHARS = 500      # a search longer than this is refused, not run (LT-SEC-010)
 MAX_CONCURRENT = 16        # requests handled at once; more are closed (LT-SEC-010)
 REQUEST_TIMEOUT_S = 30     # a connection is closed this long after it opened, however it trickles (LT-SEC-010)
+# until a request has shown the session cookie (or the key), it gets only this long: a browser
+# sends its headers at once, and a local process holding slots must let them go quickly
+UNAUTH_TIMEOUT_S = 5
 DB = ARCHIVE / "conversations.db"
 
 PAGE_SIZE = 50
@@ -733,7 +736,7 @@ class H(BaseHTTPRequestHandler):
             if same(qs["key"][0], ACCESS_KEY):
                 rest = {k: v[0] for k, v in qs.items() if k != "key"}
                 # "/" + the path without its leading slashes: "//host" would be another site
-                self.plain(303, "", (("Location", url("/" + u.path.lstrip("/"), **rest)),
+                self.plain(303, "", (("Location", url("/" + u.path.lstrip("/\\"), **rest)),
                                      ("Set-Cookie", f"{COOKIE}={SESSION}; HttpOnly; SameSite=Strict; Path=/")))
             else:
                 self.plain(403, "That link is from an earlier launch. Run `tape serve` for the current one.")
@@ -741,6 +744,7 @@ class H(BaseHTTPRequestHandler):
         if not same(session_cookie(self.headers.get("Cookie", "")), SESSION):
             self.plain(401, "Open the link `tape serve` printed (it carries this launch's key).")
             return False
+        self.server.arm(self.request, REQUEST_TIMEOUT_S)  # the user: the full time to answer
         return True
 
     def do_GET(self):
@@ -827,6 +831,25 @@ class Server(ThreadingHTTPServer):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+        self.deadlines = {}   # request socket → its running deadline timer
+        self.deadlines_lock = threading.Lock()
+
+    def arm(self, request, seconds):
+        """(Re)start the deadline after which this connection is cut."""
+        timer = threading.Timer(seconds, close_socket, (request,))
+        timer.daemon = True
+        with self.deadlines_lock:
+            old = self.deadlines.pop(request, None)
+            self.deadlines[request] = timer
+        if old is not None:
+            old.cancel()
+        timer.start()
+
+    def disarm(self, request):
+        with self.deadlines_lock:
+            timer = self.deadlines.pop(request, None)
+        if timer is not None:
+            timer.cancel()
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -848,13 +871,11 @@ class Server(ThreadingHTTPServer):
     def process_request_thread(self, request, client_address):
         # the handler's timeout bounds each read; this bounds the whole connection, so a
         # client sending one byte just inside the timeout cannot hold a slot for ever
-        deadline = threading.Timer(REQUEST_TIMEOUT_S, close_socket, (request,))
-        deadline.daemon = True
-        deadline.start()
+        self.arm(request, UNAUTH_TIMEOUT_S)
         try:
             super().process_request_thread(request, client_address)
         finally:
-            deadline.cancel()
+            self.disarm(request)
             self.slots.release()
 
 

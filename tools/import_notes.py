@@ -52,6 +52,8 @@ ARCHIVE = Path(_args[1]).expanduser() if len(_args) > 1 else Path(__file__).reso
 PROJECT = "notes-prehistory"
 OUT_DIR = ARCHIVE / "conversations" / PROJECT
 MIN_BYTES = 200
+# a capture larger than this is not a saved conversation; it is skipped before it is read
+MAX_BYTES = 50 * 1024 * 1024
 
 
 def mtime_iso(mtime):
@@ -75,10 +77,15 @@ def load_candidates(notes_dir):
     kept, skipped = [], []
     for p in sorted(notes_dir.glob(GLOB)):
         try:
-            text, st = safe_paths.read_source_text(p, notes_dir)
-            if st.st_size < MIN_BYTES:
-                skipped.append((p.name, f"jotting ({st.st_size}B < {MIN_BYTES}B)"))
-                continue
+            fh, st = safe_paths.open_source(p, notes_dir)
+            with fh:
+                if st.st_size < MIN_BYTES:
+                    skipped.append((p.name, f"jotting ({st.st_size}B < {MIN_BYTES}B)"))
+                    continue
+                if st.st_size > MAX_BYTES:
+                    skipped.append((p.name, f"too large ({st.st_size}B > {MAX_BYTES}B)"))
+                    continue
+                text = fh.read().decode("utf-8", "replace")
             kept.append((p, redact(text), st.st_mtime))
         except OSError as e:
             skipped.append((p.name, f"unreadable: {e}"))

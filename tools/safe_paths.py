@@ -18,6 +18,7 @@ rename folders inside the archive while it runs, which Phase 2 revisits.
 import errno
 import os
 import re
+import secrets
 import stat
 from pathlib import Path
 
@@ -80,6 +81,12 @@ def read_source_text(path, root, follow_links=True):
         return fh.read().decode("utf-8", "replace"), st
 
 
+def temp_name(name):
+    """A hidden name beside the target, random so that a file left by a killed run can
+    never collide with a later one (a reused process id made O_EXCL fail every night)."""
+    return f".{name[:200]}.{secrets.token_hex(8)}.tmp"
+
+
 def _parts(path, root):
     try:
         rel = Path(os.path.abspath(path)).relative_to(os.path.abspath(root))
@@ -106,7 +113,10 @@ def write_text(path, text, root):
             try:
                 nfd = os.open(d, os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=fd)
             except FileNotFoundError:
-                os.mkdir(d, 0o700, dir_fd=fd)
+                try:
+                    os.mkdir(d, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass  # another writer (the importer runs outside the lock) made it first
                 nfd = os.open(d, os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=fd)
             except OSError as e:
                 if e.errno in (errno.ELOOP, errno.ENOTDIR):
@@ -114,7 +124,7 @@ def write_text(path, text, root):
                 raise
             os.close(fd)
             fd = nfd
-        tmp = f".{name[:200]}.{os.getpid()}.tmp"
+        tmp = temp_name(name)
         tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o600, dir_fd=fd)
         try:
             with os.fdopen(tfd, "wb") as fh:
@@ -135,7 +145,7 @@ def _write_text_fallback(path, data, root, dirs):
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if parent.resolve() != parent:
         raise Refused("a folder on the way is a link")
-    tmp = parent / f".{path.name[:200]}.{os.getpid()}.tmp"
+    tmp = parent / temp_name(path.name)
     tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | getattr(os, "O_BINARY", 0), 0o600)
     try:
         with os.fdopen(tfd, "wb") as fh:
