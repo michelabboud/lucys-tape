@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.2.5 — 2026-09-28 · the redactor's review findings
+
+A deep review of 0.2.4 found one blocker and four gaps; all are fixed here, each with a test
+that failed first.
+
+### Fixed
+
+- **Blocker: the headless private-key rule took quadratic time.** On a long base64 run with no
+  `END` footer (a `base64` dump in a tool's output), the regex rescanned every position:
+  measured 0.34 s at 10,000 characters, 6 s at 40,000, and roughly half an hour projected
+  for 1 MB, on every nightly run. It is now code that walks backwards from each footer, so the
+  cost is linear: 1 MB of adversarial input redacts in about 0.1 s.
+- **Key formats that got through.** The list of private-key prefixes is now taken from keys
+  `openssl` generated, not written by hand. That also showed the ported P-256 prefix
+  (`MHQCAQEEI`) matched no real key; real P-256 keys start `MHcCAQEE`. Now covered: PKCS#1 RSA
+  of every size (1024 and 3072 were missing), PKCS#8 RSA, P-256/P-384/P-521 in SEC1 and
+  PKCS#8, Ed25519, X25519, Ed448, X448, OpenSSH. A single 64-character line before a footer
+  (Ed25519) counts as a key body. Public keys still survive.
+- **Keys inside JSON strings.** A private key with escaped newlines (`\n`), with or without
+  its header, left its body behind.
+- **Quoted values went in part.** `{"password": "correct horse battery staple"}` kept three
+  words, and short or comma-holding values stayed whole. A quoted value is now redacted up to
+  its closing quote.
+- **Python and grep disagreed on word boundaries next to non-ASCII text** (`密钥是sk-proj-…`):
+  the redactor skipped the key while grep in the C locale flagged it, so the nightly job
+  stopped; in a UTF-8 locale both skipped it and it was committed. The redactor and the
+  guard's masker now use ASCII rules and the guard's grep runs with `LC_ALL=C`.
+- Two keys glued together are both redacted in one pass; a short last line of a cut-off key
+  is redacted too.
+- **Older guard/redactor mismatches** (ADR 0003): `sk-ant-` with 15–19 characters, `xai-` or
+  `AKIA` glued to a word, and `AKIA` with 17+ characters were flagged by the guard but not
+  removed by the redactor. The masker caught them, but the invariant was broken; it holds now.
+
+### Corrected
+
+- v0.2.4's entry says 35 new test cases failed first; the reviewer counted 38 failing on the
+  base, and the commit message said 40. The count that stands is 38.
+- The `sha384-` exclusion added in 0.2.4 never applied (a 48-byte digest fits neither length
+  band) and is removed.
+
+### Measured
+
+On the same 1,500-file sample of a real archive, the redactor still hides nothing less than
+the one before this work (0 tokens revealed); 34 files differ, all from over-redaction.
+
 ## v0.2.4 — 2026-09-28 · the redactor closes its known blind spots
 
 ### Security

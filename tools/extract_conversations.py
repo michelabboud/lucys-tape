@@ -35,6 +35,25 @@ CONV_DIR = OUT / "conversations"
 # The redactor is the PRIMARY filter. tools/tape carries an independent leak
 # guard (LEAK_RX) that masks anything the redactor missed before any commit —
 # the redactor's pattern set must always be a superset of the guard's.
+# DER prefixes of private keys in base64, each taken from a key openssl generated
+# (2026-09-28), never written from memory: an earlier hand-written P-256 prefix
+# (MHQ…) matched no real key. PKCS#1 RSA of any size (MII + 3-char length +
+# IBAAK, i.e. version 0 then the modulus), PKCS#8 RSA, SEC1 EC P-256/P-384/P-521,
+# PKCS#8 EC, Ed25519/X25519/Ed448/X448, and the OpenSSH container. Public keys
+# (MIIBIjAN…, MCowBQYDK2Vw…), certificates and CSRs carry none of these.
+# tools/tape's LEAK_RX carries the same alternation; tests check they match.
+DER_PRIVATE_PREFIXES = (
+    r"MII[A-Za-z0-9+/]{3}IBAAK[BC]"
+    r"|MII[A-Za-z0-9+/]{3}IBADANBgkqhkiG9w0BAQEFAASC"
+    r"|MHcCAQEE|MIGkAgEBBD|MIHcAgEBBE"
+    r"|MIGHAgEAMBMGByqGSM49|MIG2AgEAMBAGByqGSM49|MIHuAgEAMBAGByqGSM49"
+    r"|MC4CAQAwBQYDK2V[uw]|MEcCAQAwBQYDK2Vx|MEYCAQAwBQYDK2Vv"
+    r"|b3BlbnNzaC1rZXktdjE"
+)
+# A literal backslash-n or backslash-r counts as a line break: a key pasted inside a
+# JSON string (or cut off by `head`) arrives with escaped newlines (LT-SEC-002 review).
+_KEY_SEP = r"(?:\s|\\[nr])+"
+
 REDACTIONS = [
     ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S), "[REDACTED PRIVATE KEY BLOCK]"),
     # Truncated paste: header + base64 body but no END footer. Must be eaten as a
@@ -42,13 +61,10 @@ REDACTIONS = [
     # lines as short as 16 chars count (LT-SEC-002): a key wrapped narrower than the
     # usual 64 columns must not leave its body behind a defanged header. The same
     # floor applies to the headless rule below.
-    ("private_key_truncated", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\s+[A-Za-z0-9+/=]{16,})+"), "[REDACTED PRIVATE KEY BLOCK]"),
-    # Headless paste: a key BODY followed by its END footer with no BEGIN header,
-    # which is what `cut -d= -f1` over an env file yields for a multi-line value (the
-    # continuation lines carry no `=`). Without this rule, pem_footer_bare defanged the
-    # footer, so the guard passed, and every base64 body token survived. Body + footer
-    # is a real secret: eaten whole, and BEFORE the bare-footer rule.
-    ("private_key_headless", re.compile(r"(?:[A-Za-z0-9+/=]{16,}\s+){2,}-----END [A-Z0-9 ]*PRIVATE KEY-----"), "[REDACTED PRIVATE KEY BLOCK]"),
+    ("private_key_truncated", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:" + _KEY_SEP + r"[A-Za-z0-9+/=]{16,})+(?:" + _KEY_SEP + r"[A-Za-z0-9+/]{1,15}={0,2}(?=[ \t]*(?:\r?\n|\\n|$)))?"), "[REDACTED PRIVATE KEY BLOCK]"),
+    # (Headless keys, a body followed by its END footer with no BEGIN header, are
+    # handled by _redact_headless_keys() in redact(), before this list runs: as a
+    # regex the rule took quadratic time on long base64 runs with no footer.)
     # A private-key body with NO PEM framing at all, recognised by its DER prefix in
     # base64: PKCS#1 RSA (MII..IBAAKCAQ / IBAAKCAgEA for 4096-bit), PKCS#8
     # (MII..IBADANBgkqhkiG9w0BAQEFAASC; AASC is the OCTET STRING only a private key
@@ -56,12 +72,12 @@ REDACTIONS = [
     # SEC1 EC (MHQCAQEEI / MIGHAgEAMBMGByqGSM49) and OpenSSH (b3BlbnNzaC1rZXktdjE).
     # The length prefix after MII is THREE base64 chars. Whitespace-separated
     # continuation is eaten too.
-    ("private_key_der_body", re.compile(r"\b(?:MII[A-Za-z0-9+/]{3}(?:IBAAKCAQ|IBAAKCAgEA|IBADANBgkqhkiG9w0BAQEFAASC)|MHQCAQEEI|MIGHAgEAMBMGByqGSM49|b3BlbnNzaC1rZXktdjE)[A-Za-z0-9+/=]*(?:\s+[A-Za-z0-9+/=]{40,})*"), "[REDACTED PRIVATE KEY BODY]"),
+    ("private_key_der_body", re.compile(r"\b(?:" + DER_PRIVATE_PREFIXES + r")[A-Za-z0-9+/=]*(?:" + _KEY_SEP + r"[A-Za-z0-9+/=]{40,})*"), "[REDACTED PRIVATE KEY BODY]"),
     # Bare header/footer in prose or code (a *mention*, no key material): defang so
     # the stored text can never trip the pre-commit leak guard, but stays readable.
     ("pem_header_bare", re.compile(r"-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----"), r"-----BEGIN (defanged) \1PRIVATE KEY-----"),
     ("pem_footer_bare", re.compile(r"-----END ([A-Z0-9 ]*)PRIVATE KEY-----"), r"-----END (defanged) \1PRIVATE KEY-----"),
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "[REDACTED sk-ant]"),
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{15,}"), "[REDACTED sk-ant]"),
     # NOTE: no trailing \b. The leak guard greps `\bsk-[A-Za-z0-9]{20}`
     # (boundary-free at the tail), so a key butting up against a word char
     # (e.g. sk-…<underscore>) tripped the guard while a trailing \b here made the
@@ -76,10 +92,10 @@ REDACTIONS = [
     ("openai_ns_key", re.compile(r"\bsk-[A-Za-z0-9]{2,12}[-_][A-Za-z0-9_\-]{20,}"), "[REDACTED sk-key]"),
     # Stripe-style secret and restricted keys: sk_live_, sk_test_, rk_live_, rk_test_.
     ("stripe_key", re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"), "[REDACTED stripe-key]"),
-    ("xai_key", re.compile(r"\bxai-[A-Za-z0-9]{20,}"), "[REDACTED xai-key]"),
+    ("xai_key", re.compile(r"xai-[A-Za-z0-9]{20,}"), "[REDACTED xai-key]"),
     ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b"), "[REDACTED github-token]"),
     ("github_fine_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b"), "[REDACTED github-pat]"),
-    ("aws_akid", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED aws-key-id]"),
+    ("aws_akid", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16,}"), "[REDACTED aws-key-id]"),
     ("google_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "[REDACTED google-key]"),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED slack-token]"),
     # Telegram bot tokens: <bot_id>:<35-char secret>. Two patterns, because the
@@ -111,16 +127,21 @@ REDACTIONS = [
     # (LT-SEC-002): `=` is not a word character, so the old `=\b` could only match
     # when the padding was followed by a letter, never by a space, quote or the end
     # of the text; and a leading \b missed keys that start with `+` or `/`.
-    # CSP / Subresource Integrity hashes ('sha256-…=') are public digests, not
-    # secrets: measured on a 400-file sample, they were every new hit, so they are
-    # excluded by their prefix.
-    ("b64_32", re.compile(r"(?<![A-Za-z0-9+/])(?<!sha256-)(?<!sha384-)(?<!sha512-)[A-Za-z0-9+/]{42,43}={1,2}(?![A-Za-z0-9+/=])"), "[REDACTED base64-key]"),
-    ("b64_64", re.compile(r"(?<![A-Za-z0-9+/])(?<!sha256-)(?<!sha384-)(?<!sha512-)[A-Za-z0-9+/]{85,87}={1,2}(?![A-Za-z0-9+/=])"), "[REDACTED base64-key]"),
+    # No lookahead after the padding: a key glued to the next one must still go in a
+    # single pass. CSP / Subresource Integrity hashes ('sha256-…=', 'sha512-…==') are
+    # public digests, not secrets: on a 400-file sample they were every new hit, so
+    # they are excluded by their prefix. (A sha384 digest is 64 chars, no padding, and
+    # fits neither band.)
+    ("b64_32", re.compile(r"(?<![A-Za-z0-9+/])(?<!sha256-)(?<!sha512-)[A-Za-z0-9+/]{42,43}={1,2}"), "[REDACTED base64-key]"),
+    ("b64_64", re.compile(r"(?<![A-Za-z0-9+/])(?<!sha256-)(?<!sha512-)[A-Za-z0-9+/]{85,87}={1,2}"), "[REDACTED base64-key]"),
     # NAME = value / NAME: value / "NAME": "value". LT-SEC-002 widened three things:
     # the name may follow an underscore (db_password, AWS_SECRET_ACCESS_KEY, where a
     # leading \b never matched), a closing quote may sit between name and separator
     # (JSON and Python dict keys), and the separator and quotes are kept, so
     # {"password": "x"} becomes {"password": "[REDACTED]"} and stays valid JSON.
+    # A quoted value is taken whole, up to its closing quote, so a passphrase with
+    # spaces or a comma, or a short one, cannot survive in part (LT-SEC-002 review).
+    ("assignment_quoted", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*)(["'])(?!\[REDACTED\]\3)(?:\\.|(?!\3)[^\\\n])+\3"""), r"\1\2\3[REDACTED]\3"),
     ("assignment", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*["']?)(?!\[REDACTED\])([^\s"',;]{6,})"""), r"\1\2[REDACTED]"),
     # Upper-case env names ending in a secret-ish suffix. Unquoted values are taken to
     # the next whitespace; quoted ones whole. An already-redacted value is left alone,
@@ -131,6 +152,70 @@ REDACTIONS = [
     # 60 chars of an app-password keyword.
     ("google_app_pw", re.compile(r"(?is)(\b(?:app|application)[ _-]?(?:password|secret|pw)\b.{0,60}?)\b[a-z]{4}[ -][a-z]{4}[ -][a-z]{4}[ -][a-z]{4}\b"), r"\1[REDACTED google-app-password]"),
 ]
+# ASCII semantics everywhere: Python's \b treats 是 or é as word characters while
+# grep in the C locale does not, so a key glued to non-ASCII text could slip past the
+# redactor yet trip the guard (or, in a UTF-8 locale, slip past both). tools/tape
+# compiles its guard with re.ASCII and greps with LC_ALL=C, so all layers agree.
+REDACTIONS = [(label, re.compile(rx.pattern, (rx.flags & ~re.UNICODE) | re.ASCII), repl)
+              for label, rx, repl in REDACTIONS]
+
+_PEM_FOOTER = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----", re.ASCII)
+_B64_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_HEADLESS_MARK = "[REDACTED PRIVATE KEY BLOCK]"
+
+
+def _redact_headless_keys(text):
+    """Redact a private-key body followed by its END footer, with no BEGIN header.
+
+    That is what `cut -d= -f1` over an env file prints for a multi-line value: the
+    continuation lines carry no `=`. Without this, pem_footer_bare defanged the footer,
+    the guard passed, and every body line survived.
+
+    Written as code, not a regex: the regex form rescanned every position of a long
+    base64 run with no footer (quadratic; a 1 MB `base64` dump took minutes). This walks
+    backwards from each footer only, so the cost is linear in the text. A body is two
+    or more base64 tokens of 16+ chars, or one of 40+, separated by whitespace or an
+    escaped newline.
+    """
+    if "-----END" not in text:
+        return text
+    out, last = [], 0
+    for m in _PEM_FOOTER.finditer(text):
+        if m.start() < last:
+            continue
+        i, start, tokens, longest = m.start(), None, 0, 0
+        while True:
+            j = i
+            while j > last:  # separators: whitespace or a literal \n / \r
+                if text[j - 1].isspace() and text[j - 1].isascii():
+                    j -= 1
+                elif j - 2 >= last and text[j - 2] == "\\" and text[j - 1] in "nr":
+                    j -= 2
+                else:
+                    break
+            if j == i and i != m.start():
+                break
+            k = j
+            while k > last and text[k - 1] in _B64_CHARS:
+                if text[k - 1] == "=" and k < j and text[k] != "=":
+                    break  # `=` only pads the end of base64; mid-token it is `NAME=`
+                if text[k - 1] in "nr" and k - 2 >= last and text[k - 2] == "\\":
+                    break  # a literal \n / \r separates lines
+                k -= 1
+            if j - k < 16 or (k > last and not (text[k - 1].isspace() or text[k - 1] in "\"'`:=(\\n")):
+                break
+            tokens, longest, start, i = tokens + 1, max(longest, j - k), k, k
+        if start is not None and (tokens >= 2 or longest >= 40):
+            out.append(text[last:start])
+            out.append(_HEADLESS_MARK)
+            last = m.end()
+            _red["private_key_headless"] += 1
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
 _red = Counter()
 _skipped = []   # (path, reason) for every source we could not read
 
@@ -173,6 +258,7 @@ def report_skipped():
 def redact(text):
     if not text:
         return text
+    text = _redact_headless_keys(text)
     for label, rx, repl in REDACTIONS:
         text, n = rx.subn(repl, text)
         if n:

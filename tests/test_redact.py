@@ -39,10 +39,13 @@ LEAK_RX = re.compile(
     r"|[0-9]{8,}:[A-Za-z0-9_-]{35}"
     # Headless private-key bodies by DER prefix — the same alternatives as the
     # redactor's private_key_der_body, so the guard stays a subset.
-    r"|\b(MII[A-Za-z0-9+/]{3}(IBAAKCAQ|IBAAKCAgEA|IBADANBgkqhkiG9w0BAQEFAASC)|MHQCAQEEI|MIGHAgEAMBMGByqGSM49|b3BlbnNzaC1rZXktdjE)"
+    r"|\b(MII[A-Za-z0-9+/]{3}IBAAK[BC]|MII[A-Za-z0-9+/]{3}IBADANBgkqhkiG9w0BAQEFAASC|MHcCAQEE|MIGkAgEBBD|MIHcAgEBBE"
+    r"|MIGHAgEAMBMGByqGSM49|MIG2AgEAMBAGByqGSM49|MIHuAgEAMBAGByqGSM49"
+    r"|MC4CAQAwBQYDK2V[uw]|MEcCAQAwBQYDK2Vx|MEYCAQAwBQYDK2Vv|b3BlbnNzaC1rZXktdjE)"
     # Namespaced sk- keys (sk-proj-, sk-svcacct-, …): narrower than the redactor's
     # openai_ns_key (lowercase namespace, hyphen only), so the guard stays a subset.
-    r"|\bsk-[a-z]{2,12}-[A-Za-z0-9_-]{20}"
+    r"|\bsk-[a-z]{2,12}-[A-Za-z0-9_-]{20}",
+    re.ASCII,  # tools/tape compiles it the same way and greps with LC_ALL=C
 )
 
 FAKE_B64 = "MIIEpAIBAAKCAQEA" + "x" * 48  # 64-char base64-ish line, like real PEM body
@@ -338,6 +341,110 @@ class CredentialShapeBlindSpotTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(redact(text), text)
+
+
+class RedactorReviewRegressionTests(unittest.TestCase):
+    """Findings from the deep review of the 0.2.4 redactor (2026-09-28)."""
+
+    # First 24 chars of keys openssl generated on 2026-09-28 (the tails are random
+    # and not included). Every one is a PRIVATE key.
+    GENERATED_PREFIXES = {
+        "rsa1024 pkcs1": "MIICXgIBAAKBgQDC39XUyYNW", "rsa1024 pkcs8": "MIICdwIBADANBgkqhkiG9w0B",
+        "rsa2048 pkcs1": "MIIEowIBAAKCAQEAwJN7dKeJ", "rsa2048 pkcs8": "MIIEvwIBADANBgkqhkiG9w0B",
+        "rsa3072 pkcs1": "MIIG5AIBAAKCAYEAsoM9+DT6", "rsa3072 pkcs8": "MIIG/QIBADANBgkqhkiG9w0B",
+        "rsa4096 pkcs1": "MIIJKAIBAAKCAgEAmEc6qAaj", "rsa4096 pkcs8": "MIIJQQIBADANBgkqhkiG9w0B",
+        "p256 sec1": "MHcCAQEEIIIDD7i/xJM1/j8p", "p256 pkcs8": "MIGHAgEAMBMGByqGSM49AgEG",
+        "p384 sec1": "MIGkAgEBBDDdYt1yxsJ++M5Z", "p384 pkcs8": "MIG2AgEAMBAGByqGSM49AgEG",
+        "p521 sec1": "MIHcAgEBBEIBKj9RposaZ2zl", "p521 pkcs8": "MIHuAgEAMBAGByqGSM49AgEG",
+        "ed25519": "MC4CAQAwBQYDK2VwBCIEIHGu", "x25519": "MC4CAQAwBQYDK2VuBCIEIBCl",
+        "ed448": "MEcCAQAwBQYDK2VxBDsEOXaF", "x448": "MEYCAQAwBQYDK2VvBDoEOGBd",
+    }
+    # PKCS#8 bodies continue with this for RSA (bytes 0x0D.. of the header).
+    RSA_PKCS8_TAIL = "AQEFAASC"
+
+    def test_every_generated_private_key_type_is_redacted_without_framing(self):
+        for kind, prefix in self.GENERATED_PREFIXES.items():
+            body = prefix + (self.RSA_PKCS8_TAIL if prefix.endswith("9w0B") else "") + "Q" * 40
+            with self.subTest(kind=kind):
+                out = redact(f"value: {body} {'Z' * 64}")
+                self.assertIn("[REDACTED PRIVATE KEY BODY]", out)
+                self.assertNotIn(body[:20], out)
+                self.assertIsNone(LEAK_RX.search(out))
+
+    def test_ed25519_public_key_survives(self):
+        pub = "MCowBQYDK2VwAyEAz3Ph73SY" + "Q" * 20
+        self.assertEqual(redact(f"pub: {pub}"), f"pub: {pub}")
+
+    def test_prefix_list_matches_the_guard(self):
+        guard = LEAK_RX.pattern
+        for alt in extract.DER_PRIVATE_PREFIXES.split("|"):
+            with self.subTest(alt=alt):
+                self.assertIn(alt, guard)
+
+    def test_headless_footer_scan_is_linear(self):
+        import time
+        blobs = ("A" * 200_000, " ".join(["A" * 76] * 3000), "\n".join(["A" * 76] * 3000))
+        for blob in blobs:
+            start = time.perf_counter()
+            redact(blob)
+            self.assertLess(time.perf_counter() - start, 2.0)
+
+    def test_single_long_line_before_footer_is_redacted(self):
+        # Ed25519 PKCS#8 is one 64-char line: body + footer, no header.
+        line = "MC4CAQAwBQYDK2VwBCIEIHGu" + "Q" * 40
+        out = redact(f"{line}\n-----END PRIVATE KEY-----")
+        self.assertNotIn(line[24:], out)
+        self.assertIsNone(LEAK_RX.search(out))
+
+    def test_headless_body_after_a_label_is_redacted_label_kept(self):
+        body = "Q" * 64
+        out = redact(f"KEY={body}\n{body}\n-----END RSA PRIVATE KEY-----")
+        self.assertNotIn(body, out)
+        self.assertIn("KEY=", out)
+
+    def test_escaped_newlines_in_a_json_string(self):
+        body = "MIIEowIBAAKCAQEAwJN7dKeJ" + "Q" * 40
+        for text in ('{"k": "-----BEGIN RSA PRIVATE KEY-----\\n' + body + '\\n' + "Z" * 64 + '\\n',
+                     '{"k": "' + "Y" * 64 + '\\n' + "Z" * 64 + '\\n-----END RSA PRIVATE KEY-----\\n"}'):
+            with self.subTest(text=text[:30]):
+                out = redact(text)
+                for secret in ("Q" * 40, "Z" * 64, "Y" * 64):
+                    self.assertNotIn(secret, out)
+                self.assertIsNone(LEAK_RX.search(out))
+
+    def test_short_last_line_of_a_truncated_key(self):
+        out = redact("-----BEGIN PRIVATE KEY-----\n" + "Q" * 64 + "\nZq8vLm2p==\nnext line")
+        self.assertNotIn("Zq8vLm2p", out)
+        self.assertIn("next line", out)
+
+    def test_quoted_values_go_whole(self):
+        for value in ("correct horse battery staple", "ab,cdefghij", "hunt2", 'with \\" quote'):
+            with self.subTest(value=value):
+                out = redact(f'{{"password": "{value}", "user": "ada"}}')
+                self.assertEqual(out, '{"password": "[REDACTED]", "user": "ada"}')
+
+    def test_non_ascii_neighbour_does_not_hide_a_key(self):
+        for pre in ("密钥是", "é", "ключ"):
+            with self.subTest(pre=pre):
+                out = redact(pre + "sk-proj-" + "A" * 25)
+                self.assertNotIn("A" * 25, out)
+                self.assertIsNone(LEAK_RX.search(out))
+                self.assertIsNone(re.search(LEAK_RX.pattern.encode(), out.encode(), re.ASCII))
+
+    def test_glued_base64_keys_go_in_one_pass(self):
+        k = "Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0jKl5mNo8pRs2="
+        once = redact(f"x {k}{k} y")
+        self.assertNotIn(k[:20], once)
+        self.assertEqual(redact(once), once)
+
+    def test_guard_never_fires_on_redactor_output_for_older_shapes(self):
+        # ADR 0003 violations that predate this work: guard patterns the redactor
+        # used to leave behind (sk-ant- with 15-19 chars; xai- and AKIA glued to a
+        # word; AKIA with 17+ chars).
+        for text in ("sk-ant-" + "a1B2c" * 3, "foo_xai-" + "A" * 20, "xAKIA" + "A" * 16,
+                     "AKIA" + "B" * 17, "id_AKIA" + "C" * 16):
+            with self.subTest(text=text):
+                self.assertIsNone(LEAK_RX.search(redact(text)), redact(text))
 
 
 class TelegramBotTokenTests(unittest.TestCase):

@@ -32,7 +32,7 @@ KEEP_BACKUPS="${TAPE_KEEP_BACKUPS:-8}"
 SANITY_MIN="${TAPE_SANITY_MIN:-1}"
 FORCE_DB_DAILY="${TAPE_FORCE_DB_DAILY:-0}"
 BACKUP_DIR="${TAPE_BACKUP_DIR:-}"
-LEAK_RX='sk-ant-[A-Za-z0-9]{15}|\bsk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[0-9]{8,}:[A-Za-z0-9_-]{35}|\b(MII[A-Za-z0-9+/]{3}(IBAAKCAQ|IBAAKCAgEA|IBADANBgkqhkiG9w0BAQEFAASC)|MHQCAQEEI|MIGHAgEAMBMGByqGSM49|b3BlbnNzaC1rZXktdjE)|\bsk-[a-z]{2,12}-[A-Za-z0-9_-]{20}'
+LEAK_RX='sk-ant-[A-Za-z0-9]{15}|\bsk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[0-9]{8,}:[A-Za-z0-9_-]{35}|\b(MII[A-Za-z0-9+/]{3}IBAAK[BC]|MII[A-Za-z0-9+/]{3}IBADANBgkqhkiG9w0BAQEFAASC|MHcCAQEE|MIGkAgEBBD|MIHcAgEBBE|MIGHAgEAMBMGByqGSM49|MIG2AgEAMBAGByqGSM49|MIHuAgEAMBAGByqGSM49|MC4CAQAwBQYDK2V[uw]|MEcCAQAwBQYDK2Vx|MEYCAQAwBQYDK2Vv|b3BlbnNzaC1rZXktdjE)|\bsk-[a-z]{2,12}-[A-Za-z0-9_-]{20}'
 
 # ---- pretty output -----------------------------------------------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -80,7 +80,7 @@ acquire_lock() {
 mask_leaks() { python3 - "$ARCHIVE/conversations" "$LEAK_RX" "$LOG" <<'PY'
 import os, re, sys
 root, rx_src, logpath = sys.argv[1], sys.argv[2], sys.argv[3]
-rx = re.compile(rx_src)
+rx = re.compile(rx_src, re.ASCII)  # same \b as grep in the C locale and the redactor
 MARK = "[****REDACTED-BY-GUARD****]"  # asterisked; matches no LEAK_RX (idempotent); greppable for audit
 files = hits = 0
 with open(logpath, "a", encoding="utf-8") as lg:
@@ -185,7 +185,7 @@ cmd_update() {
         ok "leak guard: output already clean (0 residual)"
     fi
     # backstop: if anything STILL matches after masking, masking itself is broken → fail-closed.
-    if grep -rlqE "$LEAK_RX" "$ARCHIVE/conversations" 2>/dev/null; then
+    if LC_ALL=C grep -rlqE "$LEAK_RX" "$ARCHIVE/conversations" 2>/dev/null; then
         die "leak guard: pattern STILL present after masking — refusing to commit (investigate the masker)"
     fi
     ok "leak guard passed (output verified clean)"
