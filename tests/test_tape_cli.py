@@ -620,6 +620,17 @@ exit 1
             with self.subTest(dest=dest):
                 self.assertIn("rc=1", self.check(dest))
 
+    def test_unicode_spellings_of_github_are_checked_or_refused(self):
+        # sol, third confirm pass: IDNA maps full-width letters to github.com, and a
+        # Cyrillic look-alike avoided the "github" test
+        full_width = "https://\uff47\uff49\uff54\uff48\uff55\uff42.com/me/public"
+        self.assertEqual(self.call("github_slug", full_width).split(" rc=")[0], "me/public")
+        self.assertIn("could not confirm", self.check(full_width))
+        for dest in ("https://g\u0456thub.com/me/r", "https://xn--gthub-cta.com/me/r"):
+            with self.subTest(dest=dest):
+                self.assertEqual(self.call("github_slug", dest).split(" rc=")[0], "INVALID")
+                self.assertIn("rc=1", self.check(dest))
+
     def test_a_look_alike_github_host_is_refused(self):
         for dest in ("git@github.com.evil.example:me/r.git", "https://github-mirror.example/me/r"):
             with self.subTest(dest=dest):

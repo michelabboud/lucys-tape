@@ -19,9 +19,22 @@ in code, each with a regression test that fails on the code before it. The entri
   archive writes that never follow a link; names that carry a secret shape renamed.
 - Tests: 101 → 265.
 
-Release gate: two blind reviews (Claude Fable 5.1: pass; gpt-5.6-sol: blocked), then three
-rounds of fixes (0.2.23–0.2.25), each confirmed. Accepted limits are in `SECURITY.md`; the
-first is the next task.
+Release gate: two blind reviews (Claude Fable 5.1: pass; gpt-5.6-sol: blocked), then four
+rounds of fixes (0.2.23–0.2.25 and the one below), each followed by a confirm pass. Accepted
+limits are in `SECURITY.md`; the first is the next task.
+
+### Fixed before tagging (third confirm pass, on the first 0.3.0 release commit)
+
+- **The rename of unsafe names could move files out of the archive.** When a folder's new name
+  was already a link to a folder elsewhere, its files were merged through the link; a
+  dangling link at a file's new name was replaced. Folders are no longer merged: a file is
+  moved with link-then-unlink, which fails rather than replace anything at the new name, a
+  folder is renamed only when nothing at all is there, and a linked `conversations` folder is
+  never walked. What cannot be renamed safely stays and is counted ("unsafe names left").
+- **Unicode spellings of GitHub skipped the privacy check.** `ｇｉｔｈｕｂ.com` (full-width
+  letters) is `github.com` to a resolver; hosts are now put in their IDNA form before the
+  check. A host that is still not plain ASCII (a Cyrillic look-alike, punycode) needs your
+  explicit per-destination choice (`tape trust --without-gh`).
 
 ## v0.2.25 — 2026-09-29 · rename, never delete; every spelling of GitHub checked
 

@@ -330,9 +330,55 @@ class ArchiveNameTests(Tmp):
         taken = d / ("redacted-" + hashlib.sha256(old.name.encode()).hexdigest()[:12] + ".md")
         taken.write_text("already here\n")
         self.session("s.jsonl", "hello")
-        self.run_extract()
+        out, _ = self.run_extract()
         self.assertEqual(taken.read_text(), "already here\n")
         self.assertEqual(old.read_text(), "old\n")
+        self.assertIn("unsafe names left    : 1", out)
+
+    def hashed(self, name):
+        import hashlib
+        return "redacted-" + hashlib.sha256(name.encode()).hexdigest()[:12]
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_link_at_a_folders_new_name_never_takes_its_files_outside(self):
+        # sol, third confirm pass: the merge followed a linked target out of the archive
+        d = self.conv() / f"proj-{self.KEY}"
+        d.mkdir()
+        (d / "a.md").write_text("kept\n")
+        away = self.tmp / "away"
+        away.mkdir()
+        (self.conv() / self.hashed(d.name)).symlink_to(away)
+        self.session("s.jsonl", "hello")
+        out, _ = self.run_extract()
+        self.assertEqual(list(away.iterdir()), [])
+        self.assertEqual((d / "a.md").read_text(), "kept\n")
+        self.assertIn("unsafe names left    : 1", out)
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_dangling_link_at_a_files_new_name_is_not_replaced(self):
+        d = self.conv() / "-p"
+        d.mkdir()
+        old = d / f"{self.KEY}.md"
+        old.write_text("old\n")
+        target = d / (self.hashed(old.name) + ".md")
+        target.symlink_to(self.tmp / "nowhere")
+        self.session("s.jsonl", "hello")
+        self.run_extract()
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(old.read_text(), "old\n")
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_linked_conversations_folder_is_never_walked(self):
+        away = self.tmp / "away"
+        away.mkdir()
+        (away / f"{self.KEY}.md").write_text("not ours\n")
+        archive = self.tmp / "archive"
+        archive.mkdir()
+        (archive / "conversations").symlink_to(away)
+        ex = load("extract_conversations")
+        ex.CONV_DIR = archive / "conversations"
+        self.assertEqual(ex.rename_unsafe_names(), (0, 0))
+        self.assertTrue((away / f"{self.KEY}.md").exists())
 
     @unittest.skipUnless(POSIX, "symlinks")
     def test_nothing_behind_a_linked_folder_is_renamed(self):

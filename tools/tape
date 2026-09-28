@@ -80,7 +80,19 @@ m = (re.match(r"(?i)^[a-z][a-z0-9+.-]*://(?:[^/@]*@)?(\[[^\]]*\]|[^/:?#]*)(?::\d
      or re.match(r"^(?:[^/@:]+@)?(\[[^\]]*\]|[^/:@]+):(?!\d+/)(.*)$", u))
 if not m:
     sys.exit(0)
-host = m.group(1).lower().rstrip(".")
+host = m.group(1).rstrip(".")
+# the name a resolver would use: IDNA maps full-width and other compatibility forms
+# ("ｇｉｔｈｕｂ.com") to plain ASCII; a host that is still not ASCII afterwards is a
+# look-alike or an unusual server, and needs your explicit per-destination choice
+try:
+    host = host.encode("idna").decode("ascii") if not host.isascii() else host
+except UnicodeError:
+    print("INVALID", end="")
+    sys.exit(0)
+host = host.lower().rstrip(".")
+if host.startswith("xn--") or ".xn--" in host:
+    print("INVALID", end="")
+    sys.exit(0)
 if host not in ("github.com", "www.github.com", "ssh.github.com"):
     # a host that mentions GitHub but is not one of its names (github.com.evil, a
     # look-alike) is refused, never treated as "not GitHub" and pushed unchecked

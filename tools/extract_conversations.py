@@ -812,12 +812,17 @@ def rename_unsafe_names():
     Since 0.2.14 new names pass through the redactor (a name that would change becomes
     redacted-<hash>), but files written by older versions keep their old names. When
     masking later touches such a file, the commit gate refuses its name, and would on every
-    run. The fix renames, never deletes: content is moved byte for byte, a name already
-    taken is never overwritten, and the old name stays in git history (the gate lets the
-    removal of a path through, never the addition of a sensitive one).
+    run. The fix renames, never deletes or merges: a file is moved with link-then-unlink,
+    which fails instead of replacing anything already at the new name (a file, a folder, a
+    dangling link); a folder is renamed only when nothing at all occupies its new name.
+    Anything that cannot be renamed safely is left where it is and counted. Nothing outside
+    archive/conversations is ever touched: a linked conversations folder, a linked folder
+    inside it, or a link at the new name stops the rename. The old name stays in git history.
 
-    Returns the number of names changed."""
-    renamed = 0
+    Returns (renamed, left_in_place)."""
+    renamed = left = 0
+    if CONV_DIR.is_symlink():
+        return renamed, left
     root = CONV_DIR.resolve()
     # deepest first, so a file is moved before the folder that holds it is renamed
     for p in sorted(CONV_DIR.rglob("*"), key=lambda q: len(q.parts), reverse=True):
@@ -826,29 +831,31 @@ def rename_unsafe_names():
         # rglob follows linked folders on Python < 3.13: touch only what really lies inside
         if p.parent.resolve() != root.joinpath(p.parent.relative_to(CONV_DIR)):
             continue
-        stem, dot, ext = p.name.rpartition(".") if p.is_file() else (p.name, "", "")
+        is_file = p.is_file()
+        _, dot, ext = p.name.rpartition(".") if is_file else ("", "", "")
         safe = "redacted-" + hashlib.sha256(p.name.encode("utf-8", "surrogateescape")).hexdigest()[:12]
         target = p.with_name(safe + (dot + ext if dot else ""))
-        if target.exists():
-            if p.is_dir() and target.is_dir():   # an older and a newer spelling: merge the files
-                for child in p.iterdir():
-                    dest = target / child.name
-                    if not dest.exists() and not child.is_symlink():
-                        child.rename(dest)
-                        renamed += 1
-                if not any(p.iterdir()):
-                    p.rmdir()
-            continue                              # never overwrite: left for the user, visible in git status
-        p.rename(target)
+        try:
+            if is_file:
+                os.link(p, target, follow_symlinks=False)  # fails if anything is at target
+                os.unlink(p)
+            elif not os.path.lexists(target):
+                os.rename(p, target)
+            else:
+                left += 1
+                continue
+        except OSError:
+            left += 1  # an occupied name, a filesystem without hard links: left as it is
+            continue
         renamed += 1
-    return renamed
+    return renamed, left
 
 
 def main():
     if not PROJECTS.is_dir() and not CODEX_SESSIONS.is_dir():
         sys.exit(f"no sources found: {PROJECTS} (Claude Code) nor {CODEX_SESSIONS} (codex) — nothing to archive")
     CONV_DIR.mkdir(parents=True, exist_ok=True)
-    renamed = rename_unsafe_names()
+    renamed, unrenamed = rename_unsafe_names()
     # index: session id → its INDEX.md row. Keyed by id so a session written twice in one
     # run (a larger copy found later, under another title or date) is listed once.
     seen, index, scanned = {}, {}, 0
@@ -907,6 +914,7 @@ def main():
     print(f"conversations written: {kept}")
     print(f"secret redactions    : {sum(_red.values())}")
     print(f"unsafe names renamed : {renamed}")
+    print(f"unsafe names left    : {unrenamed}")  # could not be renamed safely: see git status
     report_skipped()
 
 
