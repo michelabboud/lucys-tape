@@ -93,8 +93,8 @@ class CodexParseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = make_rollout(d, with_dialogue=True)
             # rewrite keeping only meta + telemetry: no dialogue at all
-            keep = [l for l in p.read_text().splitlines()
-                    if '"message"' not in l or '"developer"' in l]
+            keep = [line for line in p.read_text().splitlines()
+                    if '"message"' not in line or '"developer"' in line]
             p.write_text("\n".join(keep) + "\n")
             self.assertIsNone(ex.parse_codex_session(p))
 

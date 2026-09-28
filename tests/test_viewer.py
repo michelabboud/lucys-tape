@@ -23,7 +23,6 @@ import tempfile
 import threading
 import unittest
 import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
@@ -330,7 +329,7 @@ class HttpTests(unittest.TestCase):
     def setUpClass(cls):
         cls.archive = make_archive(DEMO)
         cls.v = load_viewer(cls.archive)
-        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), cls.v.H)
+        cls.srv = cls.v.Server(("127.0.0.1", 0), cls.v.H)
         cls.port = cls.srv.server_address[1]
         cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
         cls.thread.start()
@@ -341,8 +340,11 @@ class HttpTests(unittest.TestCase):
         cls.srv.server_close()
         cls.thread.join(timeout=5)
 
-    def get(self, path):
-        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+    def get(self, path, cookie=True, host=None):
+        headers = {"Cookie": f"{self.v.COOKIE}={self.v.SESSION}"} if cookie else {}
+        if host:
+            headers["Host"] = host
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, dict(r.headers), r.read().decode("utf-8")
@@ -414,6 +416,69 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(h.get("X-Content-Type-Options"), "nosniff")
         self.assertEqual(h.get("Referrer-Policy"), "no-referrer")
 
+    # --- access control (LT-SEC-007) ---------------------------------------------
+    def test_no_session_cookie_reads_nothing(self):
+        for path in ("/", "/c/s1", "/?q=fox"):
+            with self.subTest(path=path):
+                code, _, body = self.get(path, cookie=False)
+                self.assertEqual(code, 401)
+                self.assertNotIn("fox", body.lower())
+
+    def test_a_foreign_host_is_refused(self):
+        for host in ("evil.example", f"evil.example:{self.port}", "127.0.0.1:1", f"127.0.0.1.nip.io:{self.port}"):
+            with self.subTest(host=host):
+                code, _, body = self.get("/c/s1", host=host)
+                self.assertEqual(code, 403)
+                self.assertNotIn("The fox and the gate", body)
+
+    def test_the_launch_key_sets_a_strict_cookie(self):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", f"/c/s1?key={self.v.ACCESS_KEY}&q=fox")
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 303)
+        cookie = r.getheader("Set-Cookie")
+        self.assertIn(f"{self.v.COOKIE}={self.v.SESSION}", cookie)
+        for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
+            self.assertIn(flag, cookie)
+        self.assertNotIn("key=", r.getheader("Location"))
+        self.assertIn("q=fox", r.getheader("Location"))
+        c.request("GET", "/c/s1?key=wrong")
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(r.getheader("Set-Cookie"))
+        c.close()
+
+    def test_no_store_and_no_framing(self):
+        _, h, _ = self.get("/")
+        self.assertEqual(h.get("Cache-Control"), "no-store")
+        self.assertIn("frame-ancestors 'none'", h["Content-Security-Policy"])
+
+    # --- limits (LT-SEC-010) -----------------------------------------------------
+    def test_an_overlong_search_is_refused(self):
+        code, _, body = self.get("/?q=" + "a" * (self.v.MAX_QUERY_CHARS + 1))
+        self.assertEqual(code, 400)
+        self.assertIn("Search too long", body)
+
+    def test_requests_beyond_the_limit_are_closed_not_queued(self):
+        import socket
+        idle = [socket.create_connection(("127.0.0.1", self.port)) for _ in range(self.v.MAX_CONCURRENT)]
+        try:
+            import time
+            time.sleep(0.3)
+            extra = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            extra.sendall(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+            self.assertEqual(extra.recv(100), b"")  # closed without an answer
+            extra.close()
+        finally:
+            for s in idle:
+                s.close()
+        import time
+        time.sleep(0.3)
+        self.assertEqual(self.get("/")[0], 200)  # capacity comes back
+
     def test_conversation_page(self):
         code, _, body = self.get("/c/s1")
         self.assertEqual(code, 200)
@@ -443,15 +508,19 @@ class HttpTests(unittest.TestCase):
             ("user", "dialogue", "<img src=x onerror=alert(2)>"),
         ])])
         v = load_viewer(archive)
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), v.H)
+        srv = v.Server(("127.0.0.1", 0), v.H)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
         try:
-            with urllib.request.urlopen(
-                    f"http://127.0.0.1:{srv.server_address[1]}/c/x1", timeout=10) as r:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.server_address[1]}/c/x1",
+                headers={"Cookie": f"{v.COOKIE}={v.SESSION}"})
+            with urllib.request.urlopen(req, timeout=10) as r:
                 body = r.read().decode("utf-8")
         finally:
-            srv.shutdown(); srv.server_close(); t.join(timeout=5)
+            srv.shutdown()
+            srv.server_close()
+            t.join(timeout=5)
         # What makes the payload dangerous is an unescaped TAG, not the substring
         # "onerror=..." — that appears legitimately as escaped text content, so
         # asserting its absence would be asserting the wrong thing.

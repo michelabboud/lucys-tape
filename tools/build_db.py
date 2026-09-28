@@ -26,6 +26,50 @@ FAB = re.compile(r"^<!--fab (\{.*\})-->\s*$")
 TURN = re.compile(r"^<!--t role=(user|assistant|tool) kind=(dialogue|step|note) model=(\S*) ts=(\S*)-->\s*$")
 BODY_ESC = "<!--esc-->"  # see escape_body() in extract_conversations.py
 
+# The schema every metadata value must meet before it reaches the database (LT-SEC-008).
+# The viewer escapes on output as well; this is the second wall. Measured on 13,748 real
+# files (2026-09-28): ids use only these characters and are at most 55 long, timestamps
+# are ISO-8601, counts are integers, the longest free-text field is 350 characters.
+SID_RX = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+TS_RX = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d{1,9})?)?(Z|[+-]\d\d:?\d\d)?")
+MAX_COUNT = 10**9
+MAX_TEXT = {"project": 1000, "branch": 1000, "models": 2000}
+rejected = 0  # metadata values dropped by the schema, reported at the end of a build
+
+
+def reject(default):
+    global rejected
+    rejected += 1
+    return default
+
+
+def clean_ts(v):
+    if v in ("", None):
+        return ""
+    return v if isinstance(v, str) and TS_RX.fullmatch(v) else reject("")
+
+
+def clean_meta(meta, stem):
+    """The metadata as the database will hold it, or None when the file has no usable id."""
+    if not isinstance(meta, dict):
+        meta = reject({})
+    sid = meta.get("sid")
+    if not (isinstance(sid, str) and SID_RX.fullmatch(sid)):
+        if sid not in (None, ""):
+            reject(None)
+        sid = stem if SID_RX.fullmatch(stem) else None
+        if sid is None:
+            return None
+    out = {"sid": sid, "started": clean_ts(meta.get("started")), "ended": clean_ts(meta.get("ended"))}
+    for k in ("n_dialogue", "user_turns", "assistant_turns", "n_steps"):
+        v = meta.get(k, 0)
+        ok = isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_COUNT
+        out[k] = v if ok else reject(0)
+    for k, cap in MAX_TEXT.items():
+        v = meta.get(k, "")
+        out[k] = v[:cap] if isinstance(v, str) else reject("")
+    return out
+
 
 def parse_md(path):
     meta, turns = None, []
@@ -106,6 +150,8 @@ def main():
         tmp.unlink(missing_ok=True)
         raise
     print(f"built {DB_PATH} from {n} conversations")
+    if rejected:
+        print(f"{rejected} metadata value(s) failed the schema and were dropped", file=sys.stderr)
 
 
 def build(db_path):
@@ -116,21 +162,26 @@ def build(db_path):
         meta, turns = parse_md(md)
         if meta is None:
             continue
-        sid = meta.get("sid") or md.stem
+        meta = clean_meta(meta, md.stem)
+        if meta is None:
+            print(f"skipped {md.name}: no valid session id", file=sys.stderr)
+            continue
+        sid = meta["sid"]
         rel = str(md.relative_to(ARCHIVE))
         # the same session can exist under two file names (renamed by a newer version);
         # replace its turns, never append a second copy
         con.execute("DELETE FROM turns WHERE session_id = ?", (sid,))
         con.execute("DELETE FROM fts WHERE session_id = ?", (sid,))
         con.execute("INSERT OR REPLACE INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (sid, meta.get("project", ""), title_of(md), meta.get("started", ""), meta.get("ended", ""),
-                     meta.get("n_dialogue", 0), meta.get("user_turns", 0), meta.get("assistant_turns", 0),
-                     meta.get("n_steps", 0), meta.get("models", ""), meta.get("branch", ""), rel))
+                    (sid, meta["project"], title_of(md), meta["started"], meta["ended"],
+                     meta["n_dialogue"], meta["user_turns"], meta["assistant_turns"],
+                     meta["n_steps"], meta["models"], meta["branch"], rel))
         dbody, sbody = [], []
         for i, (role, kind, model, ts, text) in enumerate(turns):
-            con.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?)", (sid, i, role, kind, ts, model, text))
+            con.execute("INSERT INTO turns VALUES (?,?,?,?,?,?,?)",
+                        (sid, i, role, kind, clean_ts(ts), model[:MAX_TEXT["models"]], text))
             (dbody if kind in ("dialogue", "note") else sbody).append(text)
-        proj = meta.get("project", "")
+        proj = meta["project"]
         title = title_of(md)
         con.execute("INSERT INTO fts VALUES (?,?,?,?,?)", (sid, "dialogue", proj, title, "\n".join(dbody)))
         if sbody:

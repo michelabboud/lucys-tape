@@ -12,3 +12,4 @@ done or by the maintainer's word. Format: `date · source · status · item`.
 - 2026-07 · README "Next" · open · title-backfill helper.
 - 2026-09-28 · metadata review · planned (Phase 2, Windows) · Windows-reserved names (`CON`, `nul`, `aux.txt`) pass `path_component` unchanged; a UTF-8 BOM added by an editor stops the metadata line matching in `build_db`; `os.replace`/`mv -f` fail while the viewer holds the DB open.
 - 2026-09-28 · metadata review · open · a file renamed by a newer version leaves its old copy on disk (the extractor never deletes); the DB no longer duplicates it (0.2.16), but the stale Markdown stays until removed by hand.
+- 2026-09-28 · viewer task (1.7) · open · `tape serve`/`tape stop` find the viewer with `pgrep -f conversations_viewer.py`, which also matches any command line containing that name (another checkout's viewer, an editor, a shell loop); `tape stop` could kill the wrong process. Track the viewer by a pid file instead.

@@ -9,7 +9,10 @@ Show either alone or both combined. Each turn carries its model badge.
 
     python3 conversations_viewer.py [ARCHIVE_DIR] [PORT]   # default :8124
 
-Binds to localhost only.
+Binds to localhost only — and that alone is not an access control: any local account
+or process can reach 127.0.0.1, and a web page can reach it through DNS rebinding. So
+every request must name this exact host (Host header), and must carry the session cookie
+that only the per-launch link can set (see ACCESS_KEY below; LT-SEC-007).
 
 Design notes worth knowing before editing:
 
@@ -30,12 +33,24 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 ARCHIVE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "archive"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8124
+
+# Per-launch access. The viewer prints one link carrying ACCESS_KEY; opening it trades
+# the key for SESSION in an HttpOnly, SameSite=Strict cookie, and every other request
+# needs that cookie before the database is touched. Both are new at every launch.
+ACCESS_KEY = secrets.token_urlsafe(32)
+SESSION = secrets.token_urlsafe(32)
+COOKIE = "lt_session"
+MAX_QUERY_CHARS = 500      # a search longer than this is refused, not run (LT-SEC-010)
+MAX_CONCURRENT = 16        # requests handled at once; more are closed (LT-SEC-010)
+REQUEST_TIMEOUT_S = 30     # a connection idle this long is dropped (LT-SEC-010)
 DB = ARCHIVE / "conversations.db"
 
 PAGE_SIZE = 50
@@ -418,6 +433,14 @@ def escape_snippet(snip):
             .replace(HL_OPEN, "<mark>").replace(HL_CLOSE, "</mark>"))
 
 
+def as_int(value):
+    """A count from the DB, as a number whatever the archive stored (LT-SEC-008)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def url(path, **params):
     clean = {k: v for k, v in params.items() if v not in ("", None)}
     return f"{path}?{urlencode(clean)}" if clean else path
@@ -525,13 +548,13 @@ def sidebar(con, q="", project="", page=1, active=""):
         snip = escape_snippet(r["snip"]) if r["snip"] else ""
         is_active = r["session_id"] == active
         items.append(
-            f'<a class=item href="{html.escape(url("/c/" + r["session_id"], q=q, project=project, page=page))}"'
+            f'<a class=item href="{html.escape(url("/c/" + quote(r["session_id"], safe=""), q=q, project=project, page=page))}"'
             f'{" aria-current=true" if is_active else ""}>'
             f'<span class=t>{html.escape(r["title"])}</span>'
             + (f'<span class=snip>{snip}</span>' if snip else "")
-            + f'<span class=meta><span>{(r["started"] or "")[:10]}</span>'
+            + f'<span class=meta><span>{html.escape((r["started"] or "")[:10])}</span>'
               f'<span>{html.escape(r["project"])}</span>'
-              f'<span>💬 {r["n_dialogue"]}</span><span>🔧 {r["n_steps"]}</span>'
+              f'<span>💬 {as_int(r["n_dialogue"])}</span><span>🔧 {as_int(r["n_steps"])}</span>'
               f'<span>{html.escape((r["models"] or "?").split(",")[0].strip())}</span></span></a>')
 
     if items:
@@ -606,7 +629,7 @@ def render(con, sid, q, show_personal, show_arch):
             continue
         shown += 1
         body = highlight(text, terms)
-        ts = (r["ts"] or "")[:19].replace("T", " ")
+        ts = html.escape((r["ts"] or "")[:19].replace("T", " "))
         anchor = f"t{i}"
         if kind == "step":
             out.append(f'<div class="turn step" id={anchor}><pre>🔧 {body}</pre></div>')
@@ -645,6 +668,7 @@ def page(body, nonce, title="Lucy's Tape"):
 class H(BaseHTTPRequestHandler):
     server_version = "LucysTape"
     sys_version = ""
+    timeout = REQUEST_TIMEOUT_S
 
     def log_message(self, *a):
         pass
@@ -658,17 +682,63 @@ class H(BaseHTTPRequestHandler):
         # become script execution on a page that can read the whole archive.
         self.send_header("Content-Security-Policy",
                          f"default-src 'none'; style-src 'nonce-{nonce}'; "
-                         f"script-src 'nonce-{nonce}'; form-action 'self'; base-uri 'none'")
+                         f"script-src 'nonce-{nonce}'; form-action 'self'; base-uri 'none'; "
+                         "frame-ancestors 'none'")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(data)
 
+    def plain(self, code, text, extra=()):
+        data = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def allowed(self, u, qs):
+        """Host check and the session cookie. Returns True when the request may read
+        the archive; otherwise it has already answered."""
+        port = self.server.server_address[1]
+        if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self.plain(403, "This viewer only answers at its own address (127.0.0.1).")
+            return False
+        if "key" in qs:
+            if secrets.compare_digest(qs["key"][0], ACCESS_KEY):
+                rest = {k: v[0] for k, v in qs.items() if k != "key"}
+                self.plain(303, "", (("Location", url(u.path, **rest)),
+                                     ("Set-Cookie", f"{COOKIE}={SESSION}; HttpOnly; SameSite=Strict; Path=/")))
+            else:
+                self.plain(403, "That link is from an earlier launch. Run `tape serve` for the current one.")
+            return False
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except Exception:
+            pass
+        got = jar.get(COOKIE)
+        if got is None or not secrets.compare_digest(got.value, SESSION):
+            self.plain(401, "Open the link `tape serve` printed (it carries this launch's key).")
+            return False
+        return True
+
     def do_GET(self):
         nonce = secrets.token_urlsafe(16)
         u = urlparse(self.path)
         qs = parse_qs(u.query)
+        if not self.allowed(u, qs):
+            return
         q = qs.get("q", [""])[0]
+        if len(q) > MAX_QUERY_CHARS:
+            self.send(page(f'<div class=empty><h2>Search too long</h2><p>Keep it under {MAX_QUERY_CHARS} '
+                           'characters. <a href="/">Back to the archive</a>.</p></div>', nonce, "Search too long"),
+                      nonce, 400)
+            return
         project = qs.get("project", [""])[0]
         try:
             page_no = max(1, int(qs.get("page", ["1"])[0]))
@@ -688,14 +758,14 @@ class H(BaseHTTPRequestHandler):
                         "conversation is indexed.</p></div></main></div>")
                 self.send(page(body, nonce), nonce)
             elif u.path.startswith("/c/"):
-                sid = u.path[3:]
+                sid = unquote(u.path[3:])
                 r = con.execute("SELECT * FROM conversations WHERE session_id=?", [sid]).fetchone()
                 if not r:
                     self.send(page('<div class=empty><h2>Not found</h2>'
                                    '<p>No conversation with that id. <a href="/">Back to the archive</a>.</p>'
                                    '</div>', nonce, "Not found"), nonce, 404)
                     return
-                base = url(f"/c/{sid}", q=q, project=project, page=page_no)
+                base = url(f"/c/{quote(sid, safe='')}", q=q, project=project, page=page_no)
                 sep = "&" if "?" in base else "?"
                 tg = (
                     '<div class=toggles>'
@@ -705,10 +775,10 @@ class H(BaseHTTPRequestHandler):
                     f'<a class=toggle aria-pressed="{"true" if a_on else "false"}" '
                     f'href="{html.escape(base + sep)}personal={1 if p_on else 0}&arch={0 if a_on else 1}">'
                     '<span class=dot></span>🏛️ Architect</a>'
-                    f'<span class=count>{r["n_dialogue"]} turns · {r["n_steps"]} steps</span></div>')
+                    f'<span class=count>{as_int(r["n_dialogue"])} turns · {as_int(r["n_steps"])} steps</span></div>')
                 hdr = (f'<header class=hdr><h1>{html.escape(r["title"])}</h1><div class=tags>'
                        f'<span class=tag>📁 {html.escape(r["project"])}</span>'
-                       f'<span class=tag>📅 {(r["started"] or "")[:16].replace("T", " ")}</span>'
+                       f'<span class=tag>📅 {html.escape((r["started"] or "")[:16].replace("T", " "))}</span>'
                        f'<span class=tag>🤖 {html.escape(r["models"] or "?")}</span>'
                        + (f'<span class=tag>🌿 {html.escape(r["git_branch"])}</span>' if r["git_branch"] else "")
                        + '</div></header>')
@@ -733,11 +803,41 @@ class H(BaseHTTPRequestHandler):
                 con.close()
 
 
+class Server(ThreadingHTTPServer):
+    """Thread per request, at most MAX_CONCURRENT at once; beyond that a connection is
+    closed at once instead of queuing a thread for it (LT-SEC-010)."""
+    daemon_threads = True
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def main():
     if not DB.exists():
         print(f"No database at {DB}. Run: tape update  (or tape build on a clone)")
         sys.exit(1)
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    srv = Server(("127.0.0.1", PORT), H)
+    # the only place the key is shown: this goes to viewer.log (owner-only), which
+    # `tape serve` reads to print the link
+    print(f"open: http://127.0.0.1:{PORT}/?key={ACCESS_KEY}", flush=True)
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

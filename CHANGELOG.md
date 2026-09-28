@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.19 — 2026-09-28 · the viewer answers only you
+
+### Security
+
+- **LT-SEC-007: any web page could read the archive through the viewer.** It answered every
+  request on `127.0.0.1:8124`, so a page in your browser (with DNS rebinding) or any other local
+  program could fetch every conversation. The viewer now answers only when the `Host` header is
+  its own loopback address, and only to a browser holding this launch's session cookie. The
+  cookie is set when you open the keyed link `tape serve` prints (the key is new on every launch
+  and is written only to the owner-only `viewer.log`). The cookie is `HttpOnly` and
+  `SameSite=Strict`. A wrong or old key gets a plain refusal.
+- **LT-SEC-008: archive metadata reached the page unescaped.** Session ids, timestamps and
+  counts are now escaped at every output, ids are URL-encoded in links, and the builder stores
+  only metadata that meets a strict schema: ids of `[A-Za-z0-9._:-]` up to 128 characters (else
+  the file name, else the file is skipped), ISO-8601 timestamps, non-negative integer counts,
+  bounded text fields. The build reports how many values it dropped. All 13,748 files of a real
+  archive pass unchanged.
+- **LT-SEC-010: unbounded input and concurrency.** Searches longer than 500 characters are
+  refused, at most 16 requests are served at once (extra connections are closed), and a
+  request that stalls for 30 seconds is dropped. Pages also send `Cache-Control: no-store`
+  and `frame-ancestors 'none'`.
+
+### Changed
+
+- Bookmarks to `http://127.0.0.1:8124` stop working: open the link `tape serve` prints
+  (`tape serve` again shows it while the viewer runs).
+
+### Fixed
+
+- Five lint errors in the tests (one introduced in 0.2.16).
+
 ## v0.2.18 — 2026-09-28 · a lock that survives a reboot cannot outlive its owner
 
 ### Fixed

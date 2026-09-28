@@ -123,7 +123,10 @@ class StructureInjectionTests(unittest.TestCase):
 
 class DuplicateSessionTests(unittest.TestCase):
     def test_a_session_under_two_file_names_has_its_turns_once(self):
-        import sqlite3, tempfile, subprocess, sys
+        import sqlite3
+        import subprocess
+        import sys
+        import tempfile
         with tempfile.TemporaryDirectory() as d:
             conv = Path(d) / "conversations" / "p"
             conv.mkdir(parents=True)
@@ -136,6 +139,69 @@ class DuplicateSessionTests(unittest.TestCase):
             con = sqlite3.connect(Path(d) / "conversations.db")
             self.assertEqual(con.execute("SELECT COUNT(*) FROM turns WHERE session_id='same'").fetchone()[0], 1)
             self.assertEqual(con.execute("SELECT COUNT(*) FROM fts WHERE session_id='same'").fetchone()[0], 1)
+            con.close()
+
+
+class MetadataSchemaTests(unittest.TestCase):
+    """The builder stores only metadata that meets its schema (LT-SEC-008)."""
+
+    GOOD = {"sid": "3f2a-b.c:d_e", "started": "2026-07-02T10:00:00Z", "ended": "2026-07-02T10:05:00.123+02:00",
+            "n_dialogue": 2, "user_turns": 1, "assistant_turns": 1, "n_steps": 0,
+            "project": "webapp", "models": "claude-fable-5", "branch": "main"}
+
+    def test_real_shaped_metadata_passes_unchanged(self):
+        out = build.clean_meta(dict(self.GOOD), "stem")
+        for k, v in self.GOOD.items():
+            self.assertEqual(out[k], v, k)
+
+    def test_a_hostile_sid_falls_back_to_the_file_name(self):
+        for bad in ('x"><script>alert(1)</script>', "a b", "../x", 7, "x" * 129):
+            with self.subTest(bad=bad):
+                self.assertEqual(build.clean_meta({**self.GOOD, "sid": bad}, "safe-stem")["sid"], "safe-stem")
+
+    def test_no_valid_id_anywhere_means_the_file_is_skipped(self):
+        self.assertIsNone(build.clean_meta({**self.GOOD, "sid": "<b>"}, "bad stem<"))
+
+    def test_timestamps_must_be_iso(self):
+        for bad in ("<img src=x onerror=1>", "yesterday", 1720000000, "2026-07-02T10:00:00Z<"):
+            with self.subTest(bad=bad):
+                self.assertEqual(build.clean_meta({**self.GOOD, "started": bad}, "s")["started"], "")
+
+    def test_counts_must_be_small_non_negative_integers(self):
+        for bad in ("5", "<b>", -1, 2.5, True, 10**12, None):
+            with self.subTest(bad=bad):
+                self.assertEqual(build.clean_meta({**self.GOOD, "n_steps": bad}, "s")["n_steps"], 0)
+
+    def test_text_fields_must_be_strings_and_are_bounded(self):
+        self.assertEqual(build.clean_meta({**self.GOOD, "project": ["x"]}, "s")["project"], "")
+        self.assertEqual(len(build.clean_meta({**self.GOOD, "branch": "b" * 5000}, "s")["branch"]), 1000)
+
+    def test_metadata_that_is_not_an_object_is_ignored(self):
+        out = build.clean_meta(["not", "a", "dict"], "stem")
+        self.assertEqual(out["sid"], "stem")
+        self.assertEqual(out["n_dialogue"], 0)
+
+    def test_a_hostile_file_builds_into_safe_rows(self):
+        import sqlite3
+        import subprocess
+        import json
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            conv = Path(d) / "conversations" / "p"
+            conv.mkdir(parents=True)
+            fab = {"sid": 'x"><script>', "started": "<img>", "ended": "", "n_dialogue": "9<b>",
+                   "user_turns": 1, "assistant_turns": 0, "n_steps": 0, "project": "p", "models": "", "branch": ""}
+            (conv / "evil.md").write_text(
+                f"<!--fab {json.dumps(fab)}-->\n# t\n"
+                "<!--t role=user kind=dialogue model=- ts=<svg/onload=1>-->\n### User\nhello\n")
+            r = subprocess.run([sys.executable, str(TOOLS / "build_db.py"), d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("failed the schema", r.stderr)
+            con = sqlite3.connect(Path(d) / "conversations.db")
+            row = con.execute("SELECT session_id, started, n_dialogue FROM conversations").fetchone()
+            self.assertEqual(row, ("evil", "", 0))
+            self.assertEqual(con.execute("SELECT ts FROM turns").fetchone()[0], "")
             con.close()
 
 

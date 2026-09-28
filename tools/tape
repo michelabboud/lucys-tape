@@ -568,15 +568,23 @@ _do_backup() {
 cmd_backup() { say "forcing durable backup…"; _do_backup; }
 
 # ============================================================================
+# The viewer prints its per-launch link (with the access key) into viewer.log, which
+# only you can read; this shows it. Without the key the viewer answers nothing.
+viewer_link() { sed -n 's/^open: //p' "$ARCHIVE/viewer.log" 2>/dev/null | tail -1; }
+
 cmd_serve() {
     [ -f "$DB" ] || { say "no DB yet — building it from Markdown…"; python3 "$BUILD" "$ARCHIVE" || die "build failed (empty archive? run: tape update)"; }
     if pgrep -f "conversations_viewer.py" >/dev/null; then
-        say "viewer already running → ${B}http://127.0.0.1:${PORT}${X}"; return 0
+        say "viewer already running → ${B}$(viewer_link)${X}"; return 0
     fi
     nohup python3 "$VIEWER" "$ARCHIVE" "$PORT" >"$ARCHIVE/viewer.log" 2>&1 &
-    sleep 1
-    if pgrep -f "conversations_viewer.py" >/dev/null; then
-        say "viewer up → ${B}http://127.0.0.1:${PORT}${X}  (stop: tape stop)"
+    local i link=""
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        link="$(viewer_link)"; [ -n "$link" ] && break; sleep 0.5
+    done
+    if [ -n "$link" ] && pgrep -f "conversations_viewer.py" >/dev/null; then
+        say "viewer up → ${B}${link}${X}  (stop: tape stop)"
+        echo "  The link carries this launch's key; keep it to yourself."
     else bad "viewer failed to start — see $ARCHIVE/viewer.log"; fi
 }
 cmd_stop() {
