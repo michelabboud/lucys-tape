@@ -121,6 +121,24 @@ class StructureInjectionTests(unittest.TestCase):
         self.assertEqual(turns[0][4], "hi")
 
 
+class DuplicateSessionTests(unittest.TestCase):
+    def test_a_session_under_two_file_names_has_its_turns_once(self):
+        import sqlite3, tempfile, subprocess, sys
+        with tempfile.TemporaryDirectory() as d:
+            conv = Path(d) / "conversations" / "p"
+            conv.mkdir(parents=True)
+            meta = {"sid": "same", "title": "t", "started": "", "ended": "", "models": "", "branch": "",
+                    "n_dialogue": 1, "user_turns": 1, "assistant_turns": 0, "n_steps": 0,
+                    "turns": [("user", "dialogue", "", "", "hello")]}
+            extract.write_markdown(meta, "p", conv / "old-name__same.md")
+            extract.write_markdown(meta, "p", conv / "new-name__same.md")
+            subprocess.run([sys.executable, str(TOOLS / "build_db.py"), d], check=True, capture_output=True)
+            con = sqlite3.connect(Path(d) / "conversations.db")
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM turns WHERE session_id='same'").fetchone()[0], 1)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM fts WHERE session_id='same'").fetchone()[0], 1)
+            con.close()
+
+
 class NameSafetyTests(unittest.TestCase):
     def test_a_name_needing_redaction_becomes_a_hash(self):
         name = extract.path_component("sk-proj-" + "A" * 30)

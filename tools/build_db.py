@@ -118,6 +118,10 @@ def build(db_path):
             continue
         sid = meta.get("sid") or md.stem
         rel = str(md.relative_to(ARCHIVE))
+        # the same session can exist under two file names (renamed by a newer version);
+        # replace its turns, never append a second copy
+        con.execute("DELETE FROM turns WHERE session_id = ?", (sid,))
+        con.execute("DELETE FROM fts WHERE session_id = ?", (sid,))
         con.execute("INSERT OR REPLACE INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (sid, meta.get("project", ""), title_of(md), meta.get("started", ""), meta.get("ended", ""),
                      meta.get("n_dialogue", 0), meta.get("user_turns", 0), meta.get("assistant_turns", 0),

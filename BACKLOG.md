@@ -10,3 +10,5 @@ done or by the maintainer's word. Format: `date · source · status · item`.
 - 2026-09-28 · repo review · open · v0.1.1 and v0.1.2 appear in CHANGELOG but were never tagged; history is not rewritten, the gap is noted in CHANGELOG instead.
 - 2026-07 · plans · parked · semantic search (`docs/plans/semantic-search.md`).
 - 2026-07 · README "Next" · open · title-backfill helper.
+- 2026-09-28 · metadata review · planned (Phase 2, Windows) · Windows-reserved names (`CON`, `nul`, `aux.txt`) pass `path_component` unchanged; a UTF-8 BOM added by an editor stops the metadata line matching in `build_db`; `os.replace`/`mv -f` fail while the viewer holds the DB open.
+- 2026-09-28 · metadata review · open · a file renamed by a newer version leaves its old copy on disk (the extractor never deletes); the DB no longer duplicates it (0.2.16), but the stale Markdown stays until removed by hand.

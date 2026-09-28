@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.16 — 2026-09-28 · one session, one set of turns
+
+### Fixed
+
+- A session stored under two file names (for example renamed by a newer version) had its turns
+  inserted twice in the search database, so the viewer showed them twice. The build now
+  replaces a session's turns instead of appending.
+
 ## v0.2.15 — 2026-09-28 · the metadata review findings
 
 ### Security
