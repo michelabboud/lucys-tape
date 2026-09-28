@@ -83,7 +83,7 @@ Prefer to read before you run (wise)? Then:
 git clone https://github.com/michelabboud/lucys-tape.git ~/lucys-tape
 cd ~/lucys-tape
 tools/tape init        # the same wizard
-tape serve             # prints a private link to http://127.0.0.1:8124
+tape serve             # prints a private link: http://127.0.0.1:8124/s/<key>/
 ```
 
 Requirements: `python3` (stdlib only — **no pip installs, ever**) and `git`. That's it.
@@ -111,7 +111,7 @@ whole thing inside WSL (recommended — it's also where Claude Code is happiest)
 |---|---|
 | `tape init` | One-time setup wizard: private remote, first extraction, timer |
 | `tape update` | Refresh now: extract → build DB → leak-guard → commit → push to the trusted repo only |
-| `tape serve` / `tape stop` | Start/stop the local viewer (`:8124`). `serve` prints a link carrying this launch's key; open that link, keep it to yourself |
+| `tape serve` / `tape stop` | Start/stop the local viewer (`:8124`). `serve` prints a link whose path carries this launch's key (`/s/<key>/`); open that link, keep it to yourself |
 | `tape status` | Timer, repo, disk, last-run health at a glance |
 | `tape stats` | Archive statistics: conversations, projects, models, turns |
 | `tape build` | Rebuild the search DB from Markdown (works on any clone) |

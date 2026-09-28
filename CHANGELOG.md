@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.3.1 — 2026-09-29 · the viewer's key is its path, not a cookie
+
+### Security
+
+- **LT-SEC-007, the v0.3.0 known limit: the viewer's session cookie reached every service on
+  127.0.0.1.** Browsers separate cookies by host, not by port, so a web service run by another
+  account on the same machine, visited in the same browser, received the cookie and could replay
+  it. The viewer now lives under a secret path, `http://127.0.0.1:8124/s/<key>/`, new at every
+  launch; every link and form it renders carries it, and any other path is refused before the
+  database is touched. A path is sent only to the address you open, and the pages set
+  `no-referrer`. No cookie is set at all, so the cookie parsing, key exchange and redirect of
+  0.2.19–0.2.20 are gone with their edge cases.
+- The redactor scrubs the key from a printed `/s/<key>/` link as it did from `?key=`.
+
+### Changed
+
+- The link `tape serve` prints has a new shape; old `?key=` links answer 401.
+
+### Evidence
+
+- v0.3.0's own suite asserted that opening the key link sets a cookie
+  (`test_the_launch_key_sets_a_strict_cookie`, passing at `e307def`); the new suite asserts that
+  no response ever sets one, that every link and form on real pages stays inside the launch path,
+  and that no page is read without it. A `curl` run against a real launch: bare root 401, wrong
+  key 401, foreign Host 403, the printed link 200 with no `Set-Cookie`.
+
 ## v0.3.0 — 2026-09-29 · safe to use
 
 The first phase of the 2026-09-28 plan: every finding of the July security audit

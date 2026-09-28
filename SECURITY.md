@@ -31,12 +31,12 @@ Only the latest release on `main` gets fixes.
   address elsewhere. It guards against mistakes (a changed remote, a fork, a rewrite rule), not
   against someone who can already edit your git or ssh configuration.
 
-## Known limits (v0.3.0)
+## Known limits
 
-- **The viewer's session cookie reaches other services on 127.0.0.1.** Browsers do not separate
-  cookies by port, so a web service run by another account on the same machine, which you visit
-  in the same browser, could receive it and replay it against the viewer. Its replacement (a
-  per-request capability that other ports never receive) is the next task.
+- **The viewer's link is its key.** `tape serve` prints `http://127.0.0.1:8124/s/<key>/`; the key is
+  new at every launch and is sent only to that address (no cookie, no Referer). It stays in your
+  browser history until the viewer stops; anyone who can read your browser history on this
+  account can already read the archive files.
 - **A destination that is not on github.com** (a self-hosted git server, a local path) is bound
   by address only: nothing can ask such a host whether the repo is private. A host that looks
   like GitHub but is not github.com (your own GitHub Enterprise server) is refused unless you

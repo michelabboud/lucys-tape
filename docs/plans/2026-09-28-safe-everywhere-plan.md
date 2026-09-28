@@ -54,7 +54,7 @@ Lucy's Tape is public, and people install it to keep their own conversations pri
 | 1.7 | The viewer: Host-header validation and a per-run access token on loopback, escaping on every metadata sink, bounded inputs and concurrency. | 007, 008, 010 | `tools/conversations_viewer.py` | 1.6 |
 | 1.8 | Path containment: sources resolved inside their roots, symlinks refused or contained. | 009 | extractor, importers | 1.7 |
 | 1.9 | Phase close: high deep review (gate), security notes in CHANGELOG, the bughunt report annotated with each finding's fix commit, `v0.3.0` + GitHub release. | all | docs | 1.8 |
-| 1.10 | Bug-fix lane from the gate (added 2026-09-29): replace the viewer's session cookie, which browsers send to every 127.0.0.1 port, with a per-request capability other ports never receive. Deep review; released as `v0.3.1`. | 007 | `tools/conversations_viewer.py`, `tools/tape` | 1.9 |
+| 1.10 | ✅ 0.3.1 · Bug-fix lane from the gate (added 2026-09-29): replace the viewer's session cookie, which browsers send to every 127.0.0.1 port, with a per-request capability other ports never receive. Deep review; released as `v0.3.1`. | 007 | `tools/conversations_viewer.py`, `tools/tape` | 1.9 |
 
 ## Phase 2 — runs everywhere → release v0.4.0
 

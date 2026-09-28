@@ -94,7 +94,7 @@ REDACTIONS = [
     ("pem_header_bare", re.compile(r"-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----"), r"-----BEGIN (defanged) \1PRIVATE KEY-----"),
     ("pem_footer_bare", re.compile(r"-----END ([A-Z0-9 ]*)PRIVATE KEY-----"), r"-----END (defanged) \1PRIVATE KEY-----"),
     # the viewer's per-launch link (`tape serve`), when a session printed it
-    ("viewer_key", re.compile(r"(127\.0\.0\.1:\d{1,5}/\?key=)[A-Za-z0-9_-]{20,}"), r"\1[REDACTED viewer key]"),
+    ("viewer_key", re.compile(r"(127\.0\.0\.1:\d{1,5}/(?:\?key=|s/))[A-Za-z0-9_-]{20,}"), r"\1[REDACTED viewer key]"),
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{15,}"), "[REDACTED sk-ant]"),
     # NOTE: no trailing \b. The leak guard greps `\bsk-[A-Za-z0-9]{20}`
     # (boundary-free at the tail), so a key butting up against a word char

@@ -15,6 +15,7 @@ it — each reproduced by hand against the old code before being fixed here:
 
 Run: python3 -m unittest discover tests -v
 """
+import html
 import importlib.util
 import re
 import sqlite3
@@ -340,11 +341,11 @@ class HttpTests(unittest.TestCase):
         cls.srv.server_close()
         cls.thread.join(timeout=5)
 
-    def get(self, path, cookie=True, host=None):
-        headers = {"Cookie": f"{self.v.COOKIE}={self.v.SESSION}"} if cookie else {}
-        if host:
-            headers["Host"] = host
-        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", headers=headers)
+    def get(self, path, key=True, host=None):
+        """GET a route of this launch's viewer (under its secret path unless key=False)."""
+        headers = {"Host": host} if host else {}
+        prefix = self.v.PREFIX if key else ""
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{prefix}{path}", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, dict(r.headers), r.read().decode("utf-8")
@@ -417,12 +418,25 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(h.get("Referrer-Policy"), "no-referrer")
 
     # --- access control (LT-SEC-007) ---------------------------------------------
-    def test_no_session_cookie_reads_nothing(self):
-        for path in ("/", "/c/s1", "/?q=fox"):
+    def test_without_this_launchs_path_nothing_is_read(self):
+        for path in ("/", "/c/s1", "/?q=fox", f"/?key={self.v.ACCESS_KEY}", f"/c/s1?key={self.v.ACCESS_KEY}"):
             with self.subTest(path=path):
-                code, _, body = self.get(path, cookie=False)
+                code, _, body = self.get(path, key=False)
                 self.assertEqual(code, 401)
                 self.assertNotIn("fox", body.lower())
+
+    def test_a_wrong_key_in_the_path_is_refused(self):
+        k = self.v.ACCESS_KEY
+        for path in ("/s/wrong/c/s1", "/s/", "/s//", f"/s/{k}x/", f"/s/{k[:-1]}/", f"/s/{k.upper()}/",
+                     "/s/%C3%A9/", f"/x/{k}/"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(path, key=False)[0], 401)
+
+    def test_the_launch_path_opens_every_page(self):
+        for route in ("", "/", "/c/s1", "/?q=fox"):
+            with self.subTest(route=route):
+                code, _, body = self.get(route)
+                self.assertEqual(code, 200)
 
     def test_a_foreign_host_is_refused(self):
         for host in ("evil.example", f"evil.example:{self.port}", "127.0.0.1:1", f"127.0.0.1.nip.io:{self.port}"):
@@ -431,68 +445,33 @@ class HttpTests(unittest.TestCase):
                 self.assertEqual(code, 403)
                 self.assertNotIn("The fox and the gate", body)
 
-    def test_the_launch_key_sets_a_strict_cookie(self):
-        import http.client
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        c.request("GET", f"/c/s1?key={self.v.ACCESS_KEY}&q=fox")
-        r = c.getresponse()
-        r.read()
-        self.assertEqual(r.status, 303)
-        cookie = r.getheader("Set-Cookie")
-        self.assertIn(f"{self.v.COOKIE}={self.v.SESSION}", cookie)
-        for flag in ("HttpOnly", "SameSite=Strict", "Path=/"):
-            self.assertIn(flag, cookie)
-        self.assertNotIn("key=", r.getheader("Location"))
-        self.assertIn("q=fox", r.getheader("Location"))
-        c.request("GET", "/c/s1?key=wrong")
-        r = c.getresponse()
-        r.read()
-        self.assertEqual(r.status, 403)
-        self.assertIsNone(r.getheader("Set-Cookie"))
-        c.close()
+    def test_no_cookie_is_ever_set(self):
+        # a cookie reaches every port on 127.0.0.1 (the v0.3.0 known limit); the path does not
+        for route in ("/", "/c/s1", "/?q=fox"):
+            with self.subTest(route=route):
+                _, h, _ = self.get(route)
+                self.assertNotIn("Set-Cookie", h)
+        _, h, _ = self.get("/", key=False)
+        self.assertNotIn("Set-Cookie", h)
 
-    def test_other_servers_cookies_do_not_lock_the_user_out(self):
-        # browsers send every 127.0.0.1 cookie to every port; SimpleCookie gave up on
-        # the whole header at the first one it could not parse
-        mine = f"{self.v.COOKIE}={self.v.SESSION}"
-        for header in ('a={"x":1,"y":2}; ' + mine, "x=a b; " + mine, "weird@name=2; " + mine,
-                       mine + "; trailing=1", "lt_session=old; " + mine):
-            with self.subTest(header=header):
-                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/c/s1", headers={"Cookie": header})
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    self.assertEqual(r.status, 200)
+    def test_every_link_and_form_stays_inside_the_launch_path(self):
+        import re
+        for route in ("/", "/c/s1", "/?q=fox", "/?q=" + "a" * (self.v.MAX_QUERY_CHARS + 1), "/c/nope"):
+            with self.subTest(route=route):
+                _, _, body = self.get(route)
+                targets = re.findall(r'(?:href|action)="([^"]*)"', body)
+                self.assertTrue(targets)
+                for t in targets:
+                    t = html.unescape(t)
+                    self.assertTrue(t.startswith(self.v.PREFIX + "/") or t.startswith("#"), t)
 
-    def test_a_wrong_cookie_among_others_is_still_refused(self):
-        code, _, _ = self._raw("/c/s1", {"Cookie": f"a=1; {self.v.COOKIE}=nope; b=2"})
-        self.assertEqual(code, 401)
-
-    def test_a_non_ascii_key_or_cookie_is_refused_cleanly(self):
-        self.assertEqual(self._raw("/?key=%C3%A9", {})[0], 403)
-        self.assertEqual(self._raw("/", {"Cookie": f"{self.v.COOKIE}=\u00e9".encode("latin-1").decode("latin-1")})[0], 401)
-
-    def test_the_redirect_after_the_key_stays_on_this_site(self):
-        import http.client
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        c.request("GET", f"//evil.example/x?key={self.v.ACCESS_KEY}", headers={"Host": f"127.0.0.1:{self.port}"})
-        r = c.getresponse()
-        r.read()
-        c.close()
-        self.assertEqual(r.status, 303)
-        self.assertTrue(r.getheader("Location").startswith("/"))
-        self.assertFalse(r.getheader("Location").startswith("//"))
-
-    def test_a_backslash_redirect_stays_on_this_site(self):
-        code, r, _ = self._raw(f"/\\evil.example/x?key={self.v.ACCESS_KEY}", {})
-        self.assertEqual(code, 303)
-        self.assertFalse(r.getheader("Location").startswith(("//", "/\\")), r.getheader("Location"))
-
-    def test_the_user_gets_the_full_time_once_the_cookie_is_shown(self):
+    def test_the_user_gets_the_full_time_once_the_path_is_right(self):
         seen = []
         real = self.srv.arm
         self.srv.arm = lambda req, s: (seen.append(s), real(req, s))
         try:
             self.assertEqual(self.get("/")[0], 200)
-            self.assertEqual(self.get("/", cookie=False)[0], 401)
+            self.assertEqual(self.get("/", key=False)[0], 401)
         finally:
             self.srv.arm = real
         self.assertEqual(seen, [self.v.UNAUTH_TIMEOUT_S, self.v.REQUEST_TIMEOUT_S, self.v.UNAUTH_TIMEOUT_S])
@@ -600,9 +579,7 @@ class HttpTests(unittest.TestCase):
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
         try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{srv.server_address[1]}/c/x1",
-                headers={"Cookie": f"{v.COOKIE}={v.SESSION}"})
+            req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}{v.PREFIX}/c/x1")
             with urllib.request.urlopen(req, timeout=10) as r:
                 body = r.read().decode("utf-8")
         finally:

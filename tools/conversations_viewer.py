@@ -42,14 +42,14 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 ARCHIVE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "archive"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8124
 
-# Per-launch access. The viewer prints one link carrying ACCESS_KEY; opening it trades
-# the key for SESSION in an HttpOnly, SameSite=Strict cookie, and every other request
-# needs that cookie before the database is touched. Both are new at every launch.
+# Per-launch access. The whole viewer lives under a secret path, /s/<ACCESS_KEY>/, new at
+# every launch; every link it renders carries it, and a request outside it is refused before
+# the database is touched. The URL is the capability. A cookie would be simpler, but
+# browsers send a host's cookies to every port on it, so another service on 127.0.0.1 that
+# you visit could collect and replay it (the v0.3.0 known limit). A path is sent only to the
+# URL you open. The page sets no-referrer, so the path never leaves in a Referer header.
 ACCESS_KEY = secrets.token_urlsafe(32)
-SESSION = secrets.token_urlsafe(32)
-# the port is part of the name: browsers share cookies across every port of a host, and
-# two viewers (two clones) must not overwrite each other's session
-COOKIE = f"lt_session_{PORT}"
+PREFIX = f"/s/{ACCESS_KEY}"
 MAX_QUERY_CHARS = 500      # a search longer than this is refused, not run (LT-SEC-010)
 MAX_CONCURRENT = 16        # requests handled at once; more are closed (LT-SEC-010)
 REQUEST_TIMEOUT_S = 30     # a connection is closed this long after it opened, however it trickles (LT-SEC-010)
@@ -447,8 +447,9 @@ def as_int(value):
 
 
 def url(path, **params):
+    """A link inside this launch's viewer: path is the route ("/", "/c/<id>")."""
     clean = {k: v for k, v in params.items() if v not in ("", None)}
-    return f"{path}?{urlencode(clean)}" if clean else path
+    return f"{PREFIX}{path}?{urlencode(clean)}" if clean else f"{PREFIX}{path}"
 
 
 def clamp_page(page, total):
@@ -606,7 +607,7 @@ def sidebar(con, q="", project="", page=1, active=""):
         '<circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.4" />'
         '<path d="M8 1.8a6.2 6.2 0 0 0 0 12.4z" fill="currentColor" /></svg></button>'
         '</div>'
-        f'<form class=searchbar method=get action="/" role=search>'
+        f'<form class=searchbar method=get action="{html.escape(url("/"))}" role=search>'
         f'<div class=searchrow>'
         f'<input type=search name=q placeholder="search every conversation…" '
         f'value="{html.escape(q)}" aria-label="Search conversations">'
@@ -676,19 +677,6 @@ def same(given, expected):
     return given is not None and secrets.compare_digest(given.encode(), expected.encode())
 
 
-def session_cookie(header):
-    """Our cookie's value from a Cookie header, or None.
-
-    Parsed by hand: other servers on 127.0.0.1 set cookies too, the browser sends them
-    all to every port, and SimpleCookie drops the whole header at the first one it cannot
-    parse, which would lock the user out."""
-    for part in header.split(";"):
-        name, eq, value = part.strip().partition("=")
-        if eq and name == COOKIE:
-            return value
-    return None
-
-
 class H(BaseHTTPRequestHandler):
     server_version = "LucysTape"
     sys_version = ""
@@ -725,38 +713,31 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def allowed(self, u, qs):
-        """Host check and the session cookie. Returns True when the request may read
-        the archive; otherwise it has already answered."""
+    def route(self, u):
+        """The route inside this launch's viewer ("/", "/c/<id>"), or None when the request
+        may not read the archive (it has then been answered)."""
         port = self.server.server_address[1]
         if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
             self.plain(403, "This viewer only answers at its own address (127.0.0.1).")
-            return False
-        if "key" in qs:
-            if same(qs["key"][0], ACCESS_KEY):
-                rest = {k: v[0] for k, v in qs.items() if k != "key"}
-                # "/" + the path without its leading slashes: "//host" would be another site
-                self.plain(303, "", (("Location", url("/" + u.path.lstrip("/\\"), **rest)),
-                                     ("Set-Cookie", f"{COOKIE}={SESSION}; HttpOnly; SameSite=Strict; Path=/")))
-            else:
-                self.plain(403, "That link is from an earlier launch. Run `tape serve` for the current one.")
-            return False
-        if not same(session_cookie(self.headers.get("Cookie", "")), SESSION):
-            self.plain(401, "Open the link `tape serve` printed (it carries this launch's key).")
-            return False
+            return None
+        key, slash, rest = u.path[len("/s/"):].partition("/") if u.path.startswith("/s/") else ("", "", "")
+        if not same(key, ACCESS_KEY):
+            self.plain(401, "Open the link `tape serve` printed; it carries this launch's key.")
+            return None
         self.server.arm(self.request, REQUEST_TIMEOUT_S)  # the user: the full time to answer
-        return True
+        return "/" + rest
 
     def do_GET(self):
         nonce = secrets.token_urlsafe(16)
         u = urlparse(self.path)
         qs = parse_qs(u.query)
-        if not self.allowed(u, qs):
+        path = self.route(u)
+        if path is None:
             return
         q = qs.get("q", [""])[0]
         if len(q) > MAX_QUERY_CHARS:
             self.send(page(f'<div class=empty><h2>Search too long</h2><p>Keep it under {MAX_QUERY_CHARS} '
-                           'characters. <a href="/">Back to the archive</a>.</p></div>', nonce, "Search too long"),
+                           'characters. <a href="' + html.escape(url("/")) + '">Back to the archive</a>.</p></div>', nonce, "Search too long"),
                       nonce, 400)
             return
         project = qs.get("project", [""])[0]
@@ -770,19 +751,19 @@ class H(BaseHTTPRequestHandler):
         con = None
         try:
             con = db()
-            if u.path == "/":
+            if path == "/":
                 body = (f'<div class=wrap>{sidebar(con, q, project, page_no)}'
                         '<main class=main id=main><div class=empty>'
                         "<h2>Pick a conversation</h2>"
                         "<p>Or search the whole archive — every word of every "
                         "conversation is indexed.</p></div></main></div>")
                 self.send(page(body, nonce), nonce)
-            elif u.path.startswith("/c/"):
-                sid = unquote(u.path[3:])
+            elif path.startswith("/c/"):
+                sid = unquote(path[3:])
                 r = con.execute("SELECT * FROM conversations WHERE session_id=?", [sid]).fetchone()
                 if not r:
                     self.send(page('<div class=empty><h2>Not found</h2>'
-                                   '<p>No conversation with that id. <a href="/">Back to the archive</a>.</p>'
+                                   '<p>No conversation with that id. <a href="' + html.escape(url("/")) + '">Back to the archive</a>.</p>'
                                    '</div>', nonce, "Not found"), nonce, 404)
                     return
                 base = url(f"/c/{quote(sid, safe='')}", q=q, project=project, page=page_no)
@@ -808,7 +789,7 @@ class H(BaseHTTPRequestHandler):
                 self.send(page(body, nonce, r["title"]), nonce)
             else:
                 self.send(page('<div class=empty><h2>404</h2>'
-                               '<p><a href="/">Back to the archive</a></p></div>', nonce, "404"),
+                               '<p><a href="' + html.escape(url("/")) + '">Back to the archive</a></p></div>', nonce, "404"),
                           nonce, 404)
         except sqlite3.Error as e:
             # A broken/locked DB must render a page, not a bare traceback into a
@@ -893,7 +874,7 @@ def main():
     srv = Server(("127.0.0.1", PORT), H)
     # the only place the key is shown: this goes to viewer.log (owner-only), which
     # `tape serve` reads to print the link
-    print(f"open: http://127.0.0.1:{PORT}/?key={ACCESS_KEY}", flush=True)
+    print(f"open: http://127.0.0.1:{PORT}{PREFIX}/", flush=True)
     srv.serve_forever()
 
 
