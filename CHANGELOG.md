@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.18 — 2026-09-28 · a lock that survives a reboot cannot outlive its owner
+
+### Fixed
+
+- **A reused process ID could stop every refresh.** Since 0.2.17 the lock lives in a folder that
+  survives reboots; after a crash, its recorded PID could belong to an unrelated live process,
+  and every nightly would exit quietly as "already running". The lock now records the owner's
+  PID and start time and counts as held only while both still match; a lock with no readable
+  owner (killed while being taken) is reclaimed after 6 hours; only one of two racing runs can
+  reclaim a stale lock; a busy or reclaimed lock is written to the log.
+- The lock folder is checked for a symlink before its permissions are changed.
+- Backup rotation also makes the backups it keeps private, including ones made before 0.2.17
+  (the backup folder is outside `archive/`, so the 0.2.17 hardening did not reach them).
+
+### Notes
+
+- Since 0.2.17, a setup that deliberately shared the archive with a group loses that group
+  access on the next update.
+- Rotation orders backups by the date in their names; a backup named with a wrong date sorts
+  accordingly.
+
 ## v0.2.17 — 2026-09-28 · private files, a private lock, safe backup rotation
 
 ### Security

@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -244,6 +245,45 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not ours", r.stdout)
 
+    def lockdir(self):
+        lock_id = subprocess.run(["sh", "-c", f"printf %s '{self.repo}' | cksum | cut -d' ' -f1"],
+                                 capture_output=True, text=True).stdout.strip()
+        d = self.home / ".cache" / "lucys-tape" / f"refresh-{lock_id}.lock.d"
+        d.parent.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def start_of(self, pid):
+        return " ".join(subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                       capture_output=True, text=True).stdout.split())
+
+    def test_a_reused_pid_does_not_hold_the_lock(self):
+        # a live process (this test) that did not start when the lock says it did
+        d = self.lockdir()
+        d.mkdir()
+        (d / "owner").write_text(f"{os.getpid()} Thu Jan  1 00:00:00 1970\n")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("already running", r.stdout)
+
+    def test_a_live_owner_holds_the_lock(self):
+        sleeper = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(sleeper.kill)
+        d = self.lockdir()
+        d.mkdir()
+        (d / "owner").write_text(f"{sleeper.pid} {self.start_of(sleeper.pid)}\n")
+        r = self.update()
+        self.assertIn("already running", r.stdout)
+
+    def test_a_lock_without_an_owner_waits_then_is_reclaimed(self):
+        d = self.lockdir()
+        d.mkdir()
+        self.assertIn("already running", self.update().stdout)  # fresh: could be starting up
+        old = time.time() - 7 * 3600
+        os.utime(d, (old, old))
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("reclaimed a stale refresh lock", (self.repo / "archive" / "refresh.log").read_text())
+
     def test_backup_rotation_touches_only_its_own_files(self):
         backups = self.tmp / "backups"
         backups.mkdir()
@@ -269,7 +309,8 @@ class TapeUpdateTests(TapeRepoCase):
         dated = [n for n in names if n.startswith("lucys-tape-archive-20") and (backups / n).is_file()
                  and not (backups / n).is_symlink()]
         self.assertEqual(len(dated), 2, names)
-        self.assertEqual(os.stat(backups / dated[-1]).st_mode & 0o077, 0)
+        for n in dated:  # kept backups are private, including ones made before 0.2.17
+            self.assertEqual(os.stat(backups / n).st_mode & 0o077, 0)
 
     def test_low_disk_refusal_stops_the_update(self):
         self.env["TAPE_MIN_FREE_GB"] = "999999999"

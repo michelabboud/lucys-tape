@@ -133,23 +133,50 @@ PY
 
 # Portable single-instance lock: mkdir is atomic on every POSIX filesystem
 # (flock does not exist on macOS). Stale locks (dead pid) are reclaimed.
+# A process's start time, as a second identity check beside its PID: after a crash or
+# reboot the lock's PID can belong to an unrelated live process (PIDs are reused), and
+# the lock now lives somewhere that survives reboots. `ps -o lstart=` works on Linux
+# and macOS.
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' '; }
+STALE_LOCK_MIN=360   # a lock with no readable owner is reclaimed after 6 hours
+
 acquire_lock() {
-    mkdir -p "$RUNDIR" 2>/dev/null && chmod 700 "$RUNDIR" 2>/dev/null
-    if [ ! -O "$RUNDIR" ] || [ -L "$RUNDIR" ]; then
+    [ -L "$RUNDIR" ] && { bad "the lock directory $RUNDIR is a symlink — refusing to run"; return 2; }
+    mkdir -p "$RUNDIR" 2>/dev/null
+    if [ ! -d "$RUNDIR" ] || [ -L "$RUNDIR" ] || [ ! -O "$RUNDIR" ]; then
         bad "the lock directory $RUNDIR is not a directory you own — refusing to run"; return 2
     fi
-    if [ -e "$LOCKDIR" ] && { [ ! -O "$LOCKDIR" ] || [ -L "$LOCKDIR" ]; }; then
-        bad "the refresh lock $LOCKDIR belongs to someone else — refusing to run"; return 2
+    chmod 700 "$RUNDIR" 2>/dev/null
+    if [ -e "$LOCKDIR" ] || [ -L "$LOCKDIR" ]; then
+        if [ -L "$LOCKDIR" ] || [ ! -O "$LOCKDIR" ]; then
+            bad "the refresh lock $LOCKDIR belongs to someone else — refusing to run"; return 2
+        fi
     fi
     if mkdir "$LOCKDIR" 2>/dev/null; then
-        echo $$ >"$LOCKDIR/pid"
+        printf '%s %s\n' "$$" "$(proc_start $$)" >"$LOCKDIR/owner"
         trap 'rm -rf "$LOCKDIR"; [ -n "${TMP_INDEX:-}" ] && rm -f "$TMP_INDEX"' EXIT
         return 0
     fi
-    local pid; pid="$(cat "$LOCKDIR/pid" 2>/dev/null)"
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-        rm -rf "$LOCKDIR" && acquire_lock && return 0
+    # Held. It is live only if its PID still runs AND started when the lock says.
+    local owner pid started stale=0
+    owner="$(cat "$LOCKDIR/owner" 2>/dev/null)"
+    pid="${owner%% *}"; started="${owner#* }"
+    if [ -z "$owner" ] || [ "$pid" = "$owner" ]; then
+        # no readable owner (killed between mkdir and write): stale once old enough
+        [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +"$STALE_LOCK_MIN" 2>/dev/null)" ] && stale=1
+    elif ! kill -0 "$pid" 2>/dev/null || [ "$(proc_start "$pid")" != "$started" ]; then
+        stale=1
     fi
+    if [ "$stale" -eq 1 ]; then
+        # rename first: only one of two racing runs can claim a stale lock
+        local grave="$LOCKDIR.stale.$$"
+        if mv "$LOCKDIR" "$grave" 2>/dev/null; then
+            log "reclaimed a stale refresh lock (owner: ${owner:-unknown})"
+            rm -rf "$grave"
+            acquire_lock; return $?
+        fi
+    fi
+    log "refresh lock busy (owner: ${owner:-unknown}) — this run exits"
     return 1
 }
 
@@ -386,6 +413,7 @@ mask_and_verify() {
 
 # ============================================================================
 cmd_update() {
+    mkdir -p "$ARCHIVE" 2>/dev/null  # the lock logs into it
     local lk=0; acquire_lock || lk=$?
     [ "$lk" -eq 2 ] && die "refresh lock is not ours — nothing was done"
     [ "$lk" -ne 0 ] && { say "another refresh is already running — exiting"; exit 0; }
@@ -508,8 +536,11 @@ with os.scandir(d) as it:
         if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
             mine.append((e.name, e.path))  # the date is in the name: sort by it
 failed = 0
+ordered = sorted(mine, reverse=True)
+for _name, path in ordered[:max(keep, 1)]:
+    os.chmod(path, 0o600)  # backups made before 0.2.17 were readable by others
 with open(logpath, "a", encoding="utf-8") as lg:
-    for name, path in sorted(mine, reverse=True)[max(keep, 1):]:
+    for name, path in ordered[max(keep, 1):]:
         try:
             os.unlink(path)
             lg.write(f"  backup rotation: removed {name}\n")
