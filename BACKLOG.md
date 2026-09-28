@@ -17,3 +17,6 @@ done or by the maintainer's word. Format: `date · source · status · item`.
 - 2026-09-28 · containment review (0.2.21) · open · shell redirections in `tools/tape` (`>"$ARCHIVE/viewer.log"`, `gzip -c > "$gz"`, `>>"$LOG"`) still follow a planted symlink; only a tracked symlink arriving by git could plant one under `archive/`. Route them through `safe_paths` or check `-L` first.
 - 2026-09-28 · containment review (0.2.21) · planned (Phase 2, task 2.2) · the Windows fallback in `safe_paths.write_text` creates folders through a link before refusing, and `resolve() != parent` can misfire on case, 8.3 names, `subst` drives and OneDrive redirection.
 - 2026-09-28 · containment review (0.2.22) · open · a temp file left by a killed run (`archive/**/.*.tmp`) is never removed automatically; `tape doctor` could list them.
+- 2026-09-29 · release-gate review (sol) · **next task after v0.3.0 (bug-fix lane)** · the viewer's session cookie is sent by browsers to every service on 127.0.0.1; replace it with a per-request capability that other ports never receive.
+- 2026-09-29 · release-gate review (sol) · open · the viewer renders a whole conversation in one page and search materialises every matching id; add paging and result limits.
+- 2026-09-29 · release-gate review (sol) · open · the extractor and the staged-blob scan have no aggregate size budget.

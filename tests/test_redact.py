@@ -51,6 +51,21 @@ LEAK_RX = re.compile(
 FAKE_B64 = "MIIEpAIBAAKCAQEA" + "x" * 48  # 64-char base64-ish line, like real PEM body
 
 
+class LinearTimeTests(unittest.TestCase):
+    def test_a_long_digit_run_is_scanned_in_linear_time(self):
+        # 0.2.22 gate review: the Telegram rule retried from every digit, 200,000 digits = 22 s
+        import time
+        start = time.monotonic()
+        extract.redact("7" * 200_000 + " end")
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_the_telegram_rule_still_matches_after_the_anchor(self):
+        tok = "123456789:" + "A" * 35
+        for ctx in (tok, "bot" + tok, "x" + tok, f'"{tok}"'):
+            with self.subTest(ctx=ctx):
+                self.assertNotIn("A" * 35, extract.redact(ctx))
+
+
 class ViewerKeyTests(unittest.TestCase):
     def test_a_printed_viewer_link_loses_its_key(self):
         key = "Zx9_-" + "q" * 38

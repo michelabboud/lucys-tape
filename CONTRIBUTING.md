@@ -2,7 +2,7 @@
 
 ## Setup
 
-Python 3.10+ and bash. No third-party packages: the core is standard library only (ADR 0002).
+Python 3.9+ and bash. No third-party packages: the core is standard library only (ADR 0002).
 
 ```bash
 git clone https://github.com/michelabboud/lucys-tape.git

@@ -99,6 +99,13 @@ class OpenSourceTests(Tmp):
         with self.assertRaises(sp.Refused):
             self.read(self.root / "dir" / "s.jsonl")
 
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_symlink_loop_is_refused_not_a_crash(self):
+        (self.root / "a.jsonl").symlink_to(self.root / "b.jsonl")
+        (self.root / "b.jsonl").symlink_to(self.root / "a.jsonl")
+        with self.assertRaises(sp.Refused):
+            self.read(self.root / "a.jsonl")
+
     def test_dot_dot_out_of_the_root_is_refused(self):
         with self.assertRaises(sp.Refused):
             self.read(self.root / ".." / "outside.txt")
@@ -121,6 +128,11 @@ class OpenSourceTests(Tmp):
 
 
 class WriteTextTests(Tmp):
+    @unittest.skipUnless(sys.platform.startswith(("linux", "darwin")), "POSIX with openat/renameat")
+    def test_the_descriptor_walk_is_used_where_the_platform_has_it(self):
+        # 0.2.21 tested the wrong capability and silently took the fallback everywhere
+        self.assertTrue(sp._HAVE_DIR_FD)
+
     def test_writes_privately_and_creates_folders(self):
         target = self.root / "conversations" / "p" / "x.md"
         sp.write_text(target, "hello ✓", self.root)
@@ -151,6 +163,16 @@ class WriteTextTests(Tmp):
         (self.root / "conversations").symlink_to(away)
         with self.assertRaises(sp.Refused):
             sp.write_text(self.root / "conversations" / "x.md", "x", self.root)
+        self.assertEqual(list(away.iterdir()), [])
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_linked_archive_root_is_refused(self):
+        away = self.tmp / "away"
+        away.mkdir()
+        linked = self.tmp / "linked-root"
+        linked.symlink_to(away)
+        with self.assertRaises(sp.Refused):
+            sp.write_text(linked / "x.md", "x", linked)
         self.assertEqual(list(away.iterdir()), [])
 
     def test_a_path_outside_the_root_is_refused(self):
@@ -245,6 +267,75 @@ class ExtractorContainmentTests(Tmp):
         self.assertFalse((archive / "INDEX.md").is_symlink())
 
 
+class SupersededCopyTests(Tmp):
+    """A session written under a new name leaves no older copy behind (0.3.0 gate review)."""
+
+    def run_extract(self):
+        ex = load("extract_conversations")
+        ex.PROJECTS = self.root
+        ex.CODEX_SESSIONS = self.tmp / "no-codex"
+        ex.OUT = self.tmp / "archive"
+        ex.CONV_DIR = ex.OUT / "conversations"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ex.main()
+        return buf.getvalue(), ex.OUT
+
+    def session(self, name, sid, text, project="-p"):
+        recs = [dict(r, sessionId=sid) for r in SESSION]
+        recs[0] = dict(recs[0], message={"role": "user", "content": [{"type": "text", "text": text}]})
+        p = self.root / project / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+
+    def md_files(self, archive):
+        return sorted(p.name for p in (archive / "conversations").rglob("*.md"))
+
+    def test_an_old_copy_under_another_name_is_removed(self):
+        self.session("s.jsonl", "abc-1", "a first question about foxes")
+        _, archive = self.run_extract()
+        (only,) = self.md_files(archive)
+        old = archive / "conversations" / "-p" / "2026-08-06__an-older-name__abc-1.md"
+        old.write_bytes((archive / "conversations" / "-p" / only).read_bytes())
+        out, _ = self.run_extract()
+        self.assertEqual(self.md_files(archive), [only])
+        self.assertIn("stale copies removed : 1", out)
+
+    def test_files_of_sessions_not_written_this_run_are_kept(self):
+        self.session("s.jsonl", "abc-1", "a first question about foxes")
+        _, archive = self.run_extract()
+        conv = archive / "conversations" / "notes-prehistory"
+        conv.mkdir()
+        (conv / "2026-01-01__n__note-x.md").write_text('<!--fab {"sid":"note-x"}-->\n# n\n')
+        (conv / "no-metadata.md").write_text("# hand notes\n")
+        out, _ = self.run_extract()
+        self.assertIn("2026-01-01__n__note-x.md", self.md_files(archive))
+        self.assertIn("no-metadata.md", self.md_files(archive))
+        self.assertIn("stale copies removed : 0", out)
+
+    @unittest.skipUnless(POSIX, "symlinks")
+    def test_a_link_carrying_a_written_id_is_left_alone(self):
+        self.session("s.jsonl", "abc-1", "a first question about foxes")
+        _, archive = self.run_extract()
+        (only,) = self.md_files(archive)
+        elsewhere = self.tmp / "elsewhere.md"
+        elsewhere.write_bytes((archive / "conversations" / "-p" / only).read_bytes())
+        (archive / "conversations" / "-p" / "linked.md").symlink_to(elsewhere)
+        self.run_extract()
+        self.assertTrue(elsewhere.exists())
+        self.assertTrue((archive / "conversations" / "-p" / "linked.md").is_symlink())
+
+    def test_one_session_in_two_sources_is_one_file_and_one_index_row(self):
+        # the id is the file name: the same session reached through two folders
+        self.session("dup-1.jsonl", "dup-1", "short title one", project="-p")
+        self.session("dup-1.jsonl", "dup-1", "a much longer and different title " + "x" * 400, project="-q")
+        out, archive = self.run_extract()
+        self.assertEqual(len(self.md_files(archive)), 1)
+        index = (archive / "INDEX.md").read_text()
+        self.assertEqual(index.count("dup-1"), 1)
+        self.assertIn("conversations written: 1", out)
+
+
 @unittest.skipUnless(POSIX, "symlinks")
 class ImporterContainmentTests(Tmp):
     def test_an_oversized_note_is_skipped_before_it_is_read(self):
@@ -270,6 +361,27 @@ class ImporterContainmentTests(Tmp):
 
 @unittest.skipUnless(POSIX, "symlinks")
 class BuilderContainmentTests(Tmp):
+    def test_an_empty_build_never_replaces_a_good_db(self):
+        import sqlite3
+        archive = self.root
+        conv = archive / "conversations" / "p"
+        conv.mkdir(parents=True)
+        fab = {"sid": "s1", "started": "", "ended": "", "n_dialogue": 1, "user_turns": 1,
+               "assistant_turns": 0, "n_steps": 0, "project": "p", "models": "", "branch": ""}
+        md = conv / "s1.md"
+        md.write_text(f"<!--fab {json.dumps(fab)}-->\n# t\n<!--t role=user kind=dialogue model=- ts=- -->\n### U\nhi\n")
+        def run():
+            return subprocess.run([sys.executable, str(TOOLS / "build_db.py"), str(archive)],
+                                  capture_output=True, text=True)
+        self.assertEqual(run().returncode, 0)
+        md.write_text("no metadata line: nothing here parses\n")
+        r = run()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("keeping", r.stderr)
+        con = sqlite3.connect(archive / "conversations.db")
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
+        con.close()
+
     def test_a_linked_markdown_file_is_not_built(self):
         archive = self.root
         conv = archive / "conversations" / "p"

@@ -134,7 +134,9 @@ REDACTIONS = [
     # NAME=<token> line to a single [REDACTED] instead of matching only up to the
     # space and leaving "telegram-bot-token]" dangling in the output.
     ("telegram_bot_url", re.compile(r"(?i)(/bot)\d{5,}:[A-Za-z0-9_\-]{30,}"), r"\1[REDACTED-telegram-bot-token]"),
-    ("telegram_bot_token", re.compile(r"\d{5,}:[A-Za-z0-9_\-]{30,}"), "[REDACTED-telegram-bot-token]"),
+    # (?<!\d): a match starts where a digit run starts; without it a long run of digits
+    # was retried from every position (200,000 digits took 22 s in one turn)
+    ("telegram_bot_token", re.compile(r"(?<!\d)\d{5,}:[A-Za-z0-9_\-]{30,}"), "[REDACTED-telegram-bot-token]"),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"), "[REDACTED jwt]"),
     ("bearer", re.compile(r"(?i)\b(bearer|authorization:?\s*bearer)\s+[A-Za-z0-9._\-]{20,}"), "[REDACTED bearer-token]"),
     ("conn_string_pw", re.compile(r"\b((?:postgres|postgresql|mysql|mongodb|redis|amqp)://[^:/\s]+:)[^@/\s]+(@)"), r"\1[REDACTED-PW]\2"),
@@ -804,11 +806,49 @@ def write_markdown(meta, project, path, root=None):
         write_text(path, out.getvalue(), root or Path(path).parent)
 
 
+def remove_superseded(written):
+    """Remove the older copies of sessions this run has just written under another name.
+
+    A newer version can name a conversation differently (0.2.14 hashed names that carried
+    a credential; a title or date can change), and the extractor used to leave the old file
+    behind: a second copy in the archive and the DB, and, when its name carried a credential
+    shape, a file the commit gate refuses on every run once masking touches it. Only
+    sessions written in THIS run are reconciled, so an imported note or a conversation whose
+    source is gone is never touched. The removal is committed like any archive change; the
+    old copy stays in git history.
+
+    written: session id → the path (relative to OUT) it was written to in this run."""
+    keep = {OUT / rel for rel in written.values()}
+    removed = 0
+    for md in sorted(CONV_DIR.rglob("*.md")):
+        if md in keep:
+            continue
+        try:
+            fh, _ = safe_paths.open_source(md, CONV_DIR, follow_links=False)
+            with fh:
+                first = fh.readline(65536).decode("utf-8", "replace")
+        except OSError:
+            continue  # not ours to judge: a link, a folder, unreadable
+        m = re.match(r"<!--fab (\{.*\})-->\s*$", first)
+        if not m:
+            continue
+        try:
+            sid = json.loads(m.group(1)).get("sid")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if isinstance(sid, str) and sid in written:
+            md.unlink()
+            removed += 1
+    return removed
+
+
 def main():
     if not PROJECTS.is_dir() and not CODEX_SESSIONS.is_dir():
         sys.exit(f"no sources found: {PROJECTS} (Claude Code) nor {CODEX_SESSIONS} (codex) — nothing to archive")
     CONV_DIR.mkdir(parents=True, exist_ok=True)
-    seen, index, scanned, kept = {}, [], 0, 0
+    # index: session id → its INDEX.md row. Keyed by id so a session written twice in one
+    # run (a larger copy found later, under another title or date) is listed once.
+    seen, index, scanned = {}, {}, 0
     for proj_dir in sorted(p for p in PROJECTS.iterdir() if p.is_dir()) if PROJECTS.is_dir() else []:
         files = list(proj_dir.rglob("*.jsonl"))
         if not files:
@@ -825,8 +865,7 @@ def main():
             seen[sid] = meta["chars"]
             rel = f"conversations/{label}/{date_prefix(meta['started'])}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"
             write_markdown(meta, label, OUT / rel, OUT)
-            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel))
-            kept += 1
+            index[sid] = (meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel)
     # ---- codex source (optional; same shelves, same pipeline) ----------------
     if CODEX_SESSIONS.is_dir():
         for f in sorted(CODEX_SESSIONS.rglob("rollout-*.jsonl")):
@@ -841,9 +880,10 @@ def main():
             label = path_component(meta["project"], "codex-misc")
             rel = f"conversations/{label}/{date_prefix(meta['started'])}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"
             write_markdown(meta, label, OUT / rel, OUT)
-            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel))
-            kept += 1
-    index.sort(reverse=True)
+            index[sid] = (meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel)
+    removed = remove_superseded({sid: row[6] for sid, row in index.items()})
+    kept = len(index)
+    index = sorted(index.values(), reverse=True)
     with io.StringIO() as idx:
         idx.write(f"# 📼 Lucy's Tape — Conversation Archive\n\n**{kept} conversations**, secret-scrubbed, "
                   f"from {scanned} session files. The DB is rebuilt from these files with "
@@ -864,6 +904,7 @@ def main():
     print(f"sessions scanned     : {scanned}")
     print(f"conversations written: {kept}")
     print(f"secret redactions    : {sum(_red.values())}")
+    print(f"stale copies removed : {removed}")
     report_skipped()
 
 

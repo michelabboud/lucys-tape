@@ -128,16 +128,28 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertEqual(self.db_text(), before)
 
     def test_a_guard_mask_covers_the_whole_key(self):
-        d = self.home / ".claude" / "projects" / "-home-u-proj"
-        recs = [{"type": "user", "sessionId": "iiii-9999", "timestamp": "2026-09-01T10:00:00Z", "cwd": "/home/u/proj",
-                 "gitBranch": "sk-proj-" + "A" * 20 + "TAILTAILTAILTAIL", "message": {"role": "user", "content": "hi"}},
-                {"type": "assistant", "sessionId": "iiii-9999", "timestamp": "2026-09-01T10:00:05Z",
-                 "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": "ok"}]}}]
-        (d / "iiii-9999.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        # a Markdown file with no source is never re-extracted, so only the guard's masker
+        # sees this key (0.2.22 review: the old version of this test sent the key through a
+        # session, where the redactor removed it first and the masker was never exercised)
         self.update()
-        md = next((self.repo / "archive" / "conversations").rglob("*iiii-9999.md")).read_text()
-        self.assertNotIn("TAILTAIL", md)
+        md = self.repo / "archive" / "conversations" / "-home-u-proj" / "2026-09-01__hand__hand-9.md"
+        md.write_text('<!--fab {"sid":"hand-9","project":"-home-u-proj","started":"2026-09-01T00:00:00Z"}-->\n\n# h\n'
+                      "\n<!--t role=user kind=note model=- ts=-->\n### n\n\nsk-proj-" + "A" * 20 + "TAILTAILTAILTAIL\n")
+        r = self.update()
+        self.assertIn("guard masked", r.stdout)
+        self.assertNotIn("TAILTAIL", md.read_text())
         self.assertNotIn("TAILTAIL", self.db_text())
+
+    def test_a_file_that_is_not_utf8_is_masked_not_a_stuck_nightly(self):
+        self.update()
+        md = self.repo / "archive" / "conversations" / "-home-u-proj" / "2026-09-01__hand__hand-8.md"
+        md.write_bytes(b'<!--fab {"sid":"hand-8","project":"-home-u-proj","started":"2026-09-01T00:00:00Z"}-->\n\n# h\n'
+                       b"\n<!--t role=user kind=note model=- ts=-->\n### n\n\nlatin-1 caf\xe9 sk-proj-" + b"D" * 30 + b"\n")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        body = md.read_bytes()
+        self.assertNotIn(b"D" * 20, body)
+        self.assertIn(b"caf\xe9", body)  # the rest written back byte for byte
 
     def test_leftovers_of_an_interrupted_build_are_cleaned(self):
         self.update()
@@ -199,6 +211,91 @@ class TapeUpdateTests(TapeRepoCase):
         r = self.update()
         self.assertIn("guard masked", r.stdout)
         self.assertNotIn("B" * 20, self.db_text())
+
+    def plant_leak(self):
+        d = self.repo / "archive" / "conversations" / "-home-u-proj"
+        (d / "2026-09-01__hand__hand-2.md").write_text(
+            '<!--fab {"sid":"hand-2","project":"-home-u-proj","started":"2026-09-01T00:00:00Z"}-->\n\n# hand\n'
+            "\n<!--t role=user kind=note model=- ts=-->\n### note\n\nkey sk-proj-" + "C" * 30 + "\n")
+
+    def test_serve_masks_before_it_builds_a_missing_db(self):
+        # review of 0.2.22: `tape serve` built a missing DB straight from unmasked Markdown
+        self.update()
+        self.plant_leak()
+        (self.repo / "archive" / "conversations.db").unlink()
+        script = (f"{tape_library(self.repo)}\nREPO='{self.repo}'; ARCHIVE=\"$REPO/archive\"; "
+                  "DB=\"$ARCHIVE/conversations.db\"; LOG=\"$ARCHIVE/refresh.log\"; "
+                  "BUILD=\"$REPO/tools/build_db.py\"; VIEWER=/bin/false; PORT=1\n"
+                  "pgrep(){ return 1; }\ncmd_serve")
+        subprocess.run([BASH, "-c", script], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertNotIn("C" * 20, self.db_text())
+
+    def test_a_backup_holds_the_masked_markdown_and_no_db(self):
+        # a DB built by an older version can hold what the guard masks; it stays out
+        backups = self.tmp / "backups"
+        self.env.update(TAPE_BACKUP_DIR=str(backups))
+        (self.repo / "README.md").write_text("readme\n")  # a clone always has one; the backup carries it
+        self.update()
+        self.plant_leak()
+        r = subprocess.run([BASH, str(self.repo / "tools" / "tape"), "backup"], cwd=self.tmp,
+                           env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        import tarfile
+        (tgz,) = backups.iterdir()
+        with tarfile.open(tgz) as t:
+            names = t.getnames()
+            body = b"".join(t.extractfile(m).read() for m in t.getmembers() if m.isfile())
+        self.assertFalse([n for n in names if "conversations.db" in n or n.endswith(".log")], names)
+        self.assertTrue([n for n in names if n.endswith(".md")])
+        self.assertNotIn(b"C" * 20, body)
+
+    def test_a_linked_backup_target_is_refused(self):
+        backups = self.tmp / "backups"
+        backups.mkdir()
+        self.env.update(TAPE_BACKUP_DIR=str(backups))
+        (self.repo / "README.md").write_text("readme\n")
+        self.update()
+        victim = self.tmp / "victim"
+        victim.write_text("keep me\n")
+        import datetime
+        (backups / f"lucys-tape-archive-{datetime.date.today():%Y-%m-%d}.tar.gz").symlink_to(victim)
+        r = subprocess.run([BASH, str(self.repo / "tools" / "tape"), "backup"], cwd=self.tmp,
+                           env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("symlink", r.stdout)
+        self.assertEqual(victim.read_text(), "keep me\n")
+
+    def test_a_planted_log_link_stops_the_run_before_anything_is_written(self):
+        self.update()
+        victim = self.tmp / "victim"
+        victim.write_text("keep me\n")
+        log = self.repo / "archive" / "refresh.log"
+        log.unlink()
+        log.symlink_to(victim)
+        for cmd in ("update", "serve", "status"):
+            with self.subTest(cmd=cmd):
+                r = subprocess.run([BASH, str(self.repo / "tools" / "tape"), cmd], cwd=self.tmp,
+                                   env=self.env, capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("is a symlink", r.stderr)
+                self.assertEqual(victim.read_text(), "keep me\n")
+
+    def test_an_old_named_copy_already_pushed_is_removed_by_the_next_update(self):
+        # an older version committed a session under a name it no longer writes; the next
+        # update must delete it from the archive, through the commit gate
+        self.update()
+        conv = self.repo / "archive" / "conversations"
+        (cur,) = [p for p in conv.rglob("*aaaa-1111.md")]
+        old = cur.with_name("2026-09-01__old-name__aaaa-1111.md")
+        old.write_bytes(cur.read_bytes())
+        self.git("add", "--", str(old.relative_to(self.repo)))
+        self.git("commit", "-q", "-m", "an older version's file name")
+        self.git("push", "-q", "origin", "main")
+        self.assertIn(str(old.relative_to(self.repo)), self.remote_files())
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(str(old.relative_to(self.repo)), self.remote_files())
+        self.assertIn(str(cur.relative_to(self.repo)), self.remote_files())
 
     def test_weekly_backup_and_release_skip_a_failed_refresh(self):
         backups = self.tmp / "backups"
@@ -509,6 +606,11 @@ exit 1
         script = f"{tape_library(self.repo)}\n{fn} \"$1\"; echo \" rc=$?\""
         return subprocess.run([BASH, "-c", script, "x", arg], env=self.env, capture_output=True,
                               text=True).stdout
+
+    def test_printed_urls_carry_no_control_characters(self):
+        out = self.call("safe_url", "https://github.com/me/r\x1b]0;owned\x07.git")
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x07", out)
 
     def test_github_addresses_in_every_usual_form(self):
         for url in ("https://github.com/me/r", "https://github.com/me/r/", "https://github.com/me/r.git/",

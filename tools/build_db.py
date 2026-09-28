@@ -152,6 +152,19 @@ def title_of(lines):
     return "untitled conversation"
 
 
+def existing_count(path):
+    if not path.exists():
+        return 0
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0  # not a DB we can read: nothing worth keeping over a fresh build
+
+
 def main():
     if not CONV_DIR.exists():
         print(f"No conversations at {CONV_DIR}. Run extract first.")
@@ -162,6 +175,12 @@ def main():
     tmp = Path(tmp)
     try:
         n = build(tmp)
+        # an empty build never replaces a DB that holds conversations: every file failing
+        # to parse is a broken archive or a broken build, not an empty life (LT-SEC-015)
+        if n == 0 and existing_count(DB_PATH) > 0:
+            print(f"built 0 conversations; keeping {DB_PATH} ({existing_count(DB_PATH)} conversations)",
+                  file=sys.stderr)
+            sys.exit(1)
         os.replace(tmp, DB_PATH)
     except BaseException:
         tmp.unlink(missing_ok=True)

@@ -31,7 +31,10 @@ _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 # then refused as not a regular file, instead of blocking the refresh forever.
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _HAVE_DIR_FD = (_NOFOLLOW and _DIRECTORY and os.open in os.supports_dir_fd
-                and os.mkdir in os.supports_dir_fd and os.replace in os.supports_dir_fd
+                # os.replace takes dir_fd arguments but is never listed in supports_dir_fd;
+                # it shares renameat with os.rename, which is (0.2.21 checked replace, so the
+                # descriptor walk never ran and every write took the fallback)
+                and os.mkdir in os.supports_dir_fd and os.rename in os.supports_dir_fd
                 and os.unlink in os.supports_dir_fd)
 
 
@@ -58,7 +61,10 @@ def open_source(path, root, follow_links=True):
     path, root = Path(path), Path(root).resolve()
     if not follow_links and path.is_symlink():
         raise Refused("a symlink")
-    real = path.resolve()
+    try:
+        real = path.resolve()
+    except RuntimeError as e:  # a symlink loop, on Python before 3.13 (OSError from 3.13)
+        raise Refused("a symlink loop") from e
     if not real.is_relative_to(root):
         raise Refused("outside its folder")
     fd = os.open(real, os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK)
@@ -98,16 +104,21 @@ def _parts(path, root):
     return parts[:-1], parts[-1]
 
 
-def write_text(path, text, root):
+def write_text(path, text, root, errors="strict"):
     """Write text to path (inside root) atomically, privately, and without following links.
 
     Missing folders between root and path are created (mode 700). root itself is trusted:
     it is the archive the user pointed us at."""
     dirs, name = _parts(path, root)
-    data = text.encode("utf-8")
+    data = text.encode("utf-8", errors)
     if not _HAVE_DIR_FD:
         return _write_text_fallback(Path(path), data, Path(root), dirs)
-    fd = os.open(root, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
+    try:
+        fd = os.open(root, os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused("the archive folder itself is a link") from e
+        raise
     try:
         for d in dirs:
             try:

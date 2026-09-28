@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.2.23 — 2026-09-29 · fixes from the Phase 1 release-gate review
+
+The release gate had two blind reviews: Claude Fable 5.1 (pass, six should-fixes) and
+gpt-5.6-sol (blocked, five blockers). Every claim was checked against the code before it was
+acted on; this release fixes the confirmed ones.
+
+### Fixed
+
+- **The write protection of 0.2.21 never ran on Linux.** It checked `os.replace` for
+  folder-descriptor support, which Python never lists (it lists `os.rename`, which shares the
+  call). Every write took the fallback meant for Windows: it refused linked folders too, but
+  with a check-then-write race. The descriptor walk now runs on Linux and macOS, and a test
+  fails if it is ever unavailable there. Neither review caught this; a new test did.
+- **Upgrading could leave an old copy of a conversation for ever**, and, when the old file
+  name carried a credential shape that newer masking touched, stop every nightly at the
+  commit gate. The extractor now removes an older copy of any session it has just written
+  under another name. Only sessions written in that same run are reconciled; imported notes
+  and conversations whose source is gone are never touched, and git history keeps the old
+  copy. On a real machine's sources this removed nothing (5,571 files before and after).
+- A session found in two source folders is now one file and one `INDEX.md` row. The
+  "conversations written" count is now the number of conversations, not of writes (it
+  counted 17 rewrites twice on the machine above).
+- **A long run of digits could stall the nightly.** One redactor rule retried from every digit
+  (200,000 digits took 22 seconds in one turn); it is now linear.
+- **A Markdown file that is not UTF-8 stopped every nightly** until edited by hand: the masker
+  skipped it and the byte-level backstop then refused the commit. It is now masked and
+  written back byte for byte.
+- A symlink loop in the sources crashed the extractor on Python before 3.13; it is now a
+  reported, skipped source.
+- `tape build` no longer replaces a database holding conversations with an empty one.
+
+### Security
+
+- **LT-SEC-001, two side doors closed.** `tape serve` masked nothing before building a missing
+  database; it now runs the leak guard first, like `update` and `build`. `tape backup` masked
+  the Markdown but packed whatever database was on disk, possibly one an older version built
+  before masking existed. Backups now hold the masked Markdown and no database (`tape build`
+  recreates it after a restore) and no logs (`viewer.log` holds the viewer's keyed link).
+- **Links planted in `archive/`.** `tape` refuses to run when `archive/`, its logs, the database
+  or the release snapshot path is a symlink, before anything is written; a backup refuses a
+  linked target; `safe_paths` refuses a linked archive root.
+- **LT-SEC-013:** printed URLs lose their control characters, so a remote URL cannot carry an
+  escape sequence to your terminal.
+
+### Accepted, with the reasoning (not fixed in this release)
+
+- **With no `gh` signed in, a push is not checked against GitHub's visibility.** `tape trust`
+  requires you to type `private`, the destination is fixed, and releases still require
+  GitHub to confirm PRIVATE. Making `gh` mandatory for every push would break the promise
+  that `python3` and `git` are all the tape needs. `tape doctor` warns when it cannot check.
+- **The viewer's cookie reaches other services on 127.0.0.1**, because browsers do not
+  separate cookies by port. A service run by another account on the same machine, which you
+  then visit in the same browser, could replay it. Anything running as you can already read
+  the archive. It is the first task after this release: a per-request capability that is not
+  sent to other ports.
+- The viewer loads a whole conversation into one page; an enormous conversation is slow to
+  open. This is your own data behind your own session; recorded in BACKLOG.
+
 ## v0.2.22 — 2026-09-28 · containment, after its review
 
 Fixes from the deep review of 0.2.21 (and the confirm pass on 0.2.20).
