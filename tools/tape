@@ -75,9 +75,16 @@ trusted_dest() { git config --local --get tape.destination 2>/dev/null; }
 github_slug() { python3 -c '
 import re, sys
 u = sys.argv[1].strip()
-m = (re.match(r"(?i)^(?:https?|git|ssh)://(?:[^/@]*@)?((?:www\.|ssh\.)?github\.com)(?::\d+)?/(.*)$", u)
-     or re.match(r"(?i)^(?:[^/@:]+@)?((?:www\.|ssh\.)?github\.com):(?!\d+/)(.*)$", u))
+# the host, however the address is spelled: scheme://[user@]host[:port]/path or [user@]host:path
+m = (re.match(r"(?i)^[a-z][a-z0-9+.-]*://(?:[^/@]*@)?(\[[^\]]*\]|[^/:?#]*)(?::\d*)?/(.*)$", u)
+     or re.match(r"^(?:[^/@:]+@)?(\[[^\]]*\]|[^/:@]+):(?!\d+/)(.*)$", u))
 if not m:
+    sys.exit(0)
+host = m.group(1).lower().rstrip(".")
+if host not in ("github.com", "www.github.com", "ssh.github.com"):
+    # a host that mentions GitHub but is not one of its names (github.com.evil, a
+    # look-alike) is refused, never treated as "not GitHub" and pushed unchecked
+    print("INVALID" if "github" in host else "", end="")
     sys.exit(0)
 path = re.sub(r"(?i)(\.git)?/*$", "", m.group(2).split("?")[0].split("#")[0])
 parts = path.split("/")
@@ -103,7 +110,14 @@ check_destination() {
     [ "$n" = "1" ] || { echo "origin pushes to ${n} places; it must push to exactly one"; return 1; }
     [ "$urls" = "$dest" ] || { echo "origin now pushes to $(safe_url "$urls"), not the trusted $(safe_url "$dest") — run: tape trust"; return 1; }
     slug="$(github_slug "$dest")"
-    [ "$slug" = "INVALID" ] && { echo "the destination is a GitHub address without a plain owner/name — refusing"; return 1; }
+    if [ "$slug" = "INVALID" ]; then
+        # a GitHub address without a plain owner/name, or a host that mentions GitHub
+        # without being github.com (a look-alike, or your own GitHub Enterprise server,
+        # which gh here cannot vouch for): only your explicit choice lets it through
+        [ "$(git config --local --get tape.unverifiedVisibility 2>/dev/null)" = "$dest" ] && return 0
+        echo "the destination looks like GitHub but is not a plain owner/name on github.com — refusing (your own server: tape trust --without-gh)"
+        return 1
+    fi
     if [ -n "$slug" ]; then
         vis="$(github_visibility "$slug")"
         case "$vis" in
@@ -293,11 +307,14 @@ if any(not ALLOWED.fullmatch(e[3]) or (e[2] != "D" and e[0] not in REGULAR) for 
     problems += 1
 blobs = []
 for n, (mode, oid, status, path) in enumerate(entries, 1):
+    if status == "D":
+        # removing a name takes it out of the tree the commit writes; only a name being
+        # added or kept can leak. (A name an older version wrote is renamed, then its
+        # removal must pass, or the refresh stops for ever.)
+        continue
     if rx.search(path):
         log.append(f"staged path {label(n, path)} matches the leak guard")
         problems += 1
-    if status == "D":
-        continue
     if mode not in REGULAR:
         log.append(f"staged entry {label(n, path)} is not a regular file (mode {mode})")
         problems += 1
@@ -817,7 +834,12 @@ record_destination() {
     [ "$n" = "1" ] || { bad "origin pushes to ${n} places; it must push to exactly one"; return 1; }
     is_public_upstream "$urls" && { bad "origin is the PUBLIC lucys-tape repo"; return 1; }
     slug="$(github_slug "$urls")"
-    [ "$slug" = "INVALID" ] && { bad "origin is a GitHub address without a plain owner/name"; return 1; }
+    if [ "$slug" = "INVALID" ]; then
+        [ "${TAPE_TRUST_WITHOUT_GH:-}" = "1" ] || { bad "origin looks like GitHub but is not a plain owner/name on github.com (your own GitHub server? tape trust --without-gh)"; return 1; }
+        git config --local tape.unverifiedVisibility "$urls" || { bad "could not record the destination"; return 1; }
+        warn "recorded a destination nothing can check for privacy (you chose --without-gh); make sure it is private"
+        slug=""
+    fi
     if [ -n "$slug" ]; then
         vis="$(github_visibility "$slug")"
         case "$vis" in

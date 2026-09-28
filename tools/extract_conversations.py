@@ -806,75 +806,49 @@ def write_markdown(meta, project, path, root=None):
         write_text(path, out.getvalue(), root or Path(path).parent)
 
 
-TURN_LINE = re.compile(r"^<!--t role=(\S+) kind=(\S+) model=\S* ts=(\S*)-->\s*$")
+def rename_unsafe_names():
+    """Give a safe name to every archive file or folder whose name carries a secret shape.
 
+    Since 0.2.14 new names pass through the redactor (a name that would change becomes
+    redacted-<hash>), but files written by older versions keep their old names. When
+    masking later touches such a file, the commit gate refuses its name, and would on every
+    run. The fix renames, never deletes: content is moved byte for byte, a name already
+    taken is never overwritten, and the old name stays in git history (the gate lets the
+    removal of a path through, never the addition of a sensitive one).
 
-def turn_signature(md):
-    """(role, kind, timestamp) of each turn, in order, or None when the file cannot be read.
-
-    Turn text is left out on purpose: a newer redactor masks more, so an older copy's
-    text can differ while its turns are the same turns. Body lines that look like a turn
-    were escaped by the extractor, so they cannot forge one (LT-SEC-014)."""
-    try:
-        fh, _ = safe_paths.open_source(md, CONV_DIR, follow_links=False)
-        with fh:
-            text = fh.read().decode("utf-8", "replace")
-    except OSError:
-        return None
-    first, _, _ = text.partition("\n")
-    return first, [m.groups() for m in (TURN_LINE.match(ln) for ln in text.split("\n")) if m]
-
-
-def remove_superseded(written):
-    """Remove older copies of sessions this run has just written under another name.
-
-    A newer version can name a conversation differently (0.2.14 hashed names that carried
-    a credential; a title or date can change), and the old file used to stay: a second copy
-    in the archive and the DB, and, when its name carried a credential shape, a file the
-    commit gate refuses on every run once masking touches it.
-
-    An older copy is removed only when the new file provably holds everything it held: the
-    same session id, and its turns (role, kind, timestamp) are the first turns of the new
-    file. Anything else (a note that happens to share an id, a copy with turns the new file
-    lacks) is kept and counted as a conflict. The removal is committed like any archive
-    change; the old copy stays in git history.
-
-    written: session id → the path (relative to OUT) it was written to in this run.
-    Returns (removed, kept_as_conflicts)."""
-    keep = {OUT / rel for rel in written.values()}
-    new_sigs = {}
-    removed = conflicts = 0
-    for md in sorted(CONV_DIR.rglob("*.md")):
-        if md in keep:
+    Returns the number of names changed."""
+    renamed = 0
+    root = CONV_DIR.resolve()
+    # deepest first, so a file is moved before the folder that holds it is renamed
+    for p in sorted(CONV_DIR.rglob("*"), key=lambda q: len(q.parts), reverse=True):
+        if redact(p.name) == p.name or p.is_symlink():
             continue
-        got = turn_signature(md)
-        if got is None:
-            continue  # a link, a folder, unreadable: not ours to judge
-        first, sig = got
-        m = re.match(r"<!--fab (\{.*\})-->\s*$", first)
-        if not m:
+        # rglob follows linked folders on Python < 3.13: touch only what really lies inside
+        if p.parent.resolve() != root.joinpath(p.parent.relative_to(CONV_DIR)):
             continue
-        try:
-            sid = json.loads(m.group(1)).get("sid")
-        except (json.JSONDecodeError, AttributeError):
-            continue
-        if not (isinstance(sid, str) and sid in written):
-            continue
-        if sid not in new_sigs:
-            new_sigs[sid] = (turn_signature(OUT / written[sid]) or (None, None))[1]
-        new = new_sigs[sid]
-        if sig and new is not None and new[:len(sig)] == sig:
-            md.unlink()
-            removed += 1
-        else:
-            conflicts += 1
-    return removed, conflicts
+        stem, dot, ext = p.name.rpartition(".") if p.is_file() else (p.name, "", "")
+        safe = "redacted-" + hashlib.sha256(p.name.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+        target = p.with_name(safe + (dot + ext if dot else ""))
+        if target.exists():
+            if p.is_dir() and target.is_dir():   # an older and a newer spelling: merge the files
+                for child in p.iterdir():
+                    dest = target / child.name
+                    if not dest.exists() and not child.is_symlink():
+                        child.rename(dest)
+                        renamed += 1
+                if not any(p.iterdir()):
+                    p.rmdir()
+            continue                              # never overwrite: left for the user, visible in git status
+        p.rename(target)
+        renamed += 1
+    return renamed
 
 
 def main():
     if not PROJECTS.is_dir() and not CODEX_SESSIONS.is_dir():
         sys.exit(f"no sources found: {PROJECTS} (Claude Code) nor {CODEX_SESSIONS} (codex) — nothing to archive")
     CONV_DIR.mkdir(parents=True, exist_ok=True)
+    renamed = rename_unsafe_names()
     # index: session id → its INDEX.md row. Keyed by id so a session written twice in one
     # run (a larger copy found later, under another title or date) is listed once.
     seen, index, scanned = {}, {}, 0
@@ -910,7 +884,6 @@ def main():
             rel = f"conversations/{label}/{date_prefix(meta['started'])}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"
             write_markdown(meta, label, OUT / rel, OUT)
             index[sid] = (meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel)
-    removed, conflicts = remove_superseded({sid: row[6] for sid, row in index.items()})
     kept = len(index)
     index = sorted(index.values(), reverse=True)
     with io.StringIO() as idx:
@@ -933,8 +906,7 @@ def main():
     print(f"sessions scanned     : {scanned}")
     print(f"conversations written: {kept}")
     print(f"secret redactions    : {sum(_red.values())}")
-    print(f"stale copies removed : {removed}")
-    print(f"copies kept (differ) : {conflicts}")  # same id, turns the new file lacks: never removed
+    print(f"unsafe names renamed : {renamed}")
     report_skipped()
 
 

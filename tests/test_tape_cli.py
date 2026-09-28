@@ -280,22 +280,25 @@ class TapeUpdateTests(TapeRepoCase):
                 self.assertIn("is a symlink", r.stderr)
                 self.assertEqual(victim.read_text(), "keep me\n")
 
-    def test_an_old_named_copy_already_pushed_is_removed_by_the_next_update(self):
-        # an older version committed a session under a name it no longer writes; the next
-        # update must delete it from the archive, through the commit gate
+    def test_an_old_name_carrying_a_key_does_not_stop_every_nightly(self):
+        # an older version committed a file whose NAME carries a key shape; once masking
+        # changes its content, the gate refused that name on every run (sol, 0.3.0 gate)
         self.update()
-        conv = self.repo / "archive" / "conversations"
-        (cur,) = [p for p in conv.rglob("*aaaa-1111.md")]
-        old = cur.with_name("2026-09-01__old-name__aaaa-1111.md")
-        old.write_bytes(cur.read_bytes())
+        conv = self.repo / "archive" / "conversations" / "-home-u-proj"
+        old = conv / ("2026-08-01__AKIA" + "N" * 16 + "__old.md")
+        old.write_text('<!--fab {"sid":"old-1","project":"-home-u-proj"}-->\n\n# o\n'
+                       "\n<!--t role=user kind=note model=- ts=-->\n### n\n\nplain text\n")
         self.git("add", "--", str(old.relative_to(self.repo)))
         self.git("commit", "-q", "-m", "an older version's file name")
         self.git("push", "-q", "origin", "main")
-        self.assertIn(str(old.relative_to(self.repo)), self.remote_files())
+        old.write_text(old.read_text() + "a leak the old guard missed: sk-proj-" + "M" * 30 + "\n")
         r = self.update()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertNotIn(str(old.relative_to(self.repo)), self.remote_files())
-        self.assertIn(str(cur.relative_to(self.repo)), self.remote_files())
+        files = self.remote_files()
+        self.assertNotIn(str(old.relative_to(self.repo)), files)
+        self.assertTrue([f for f in files if "/-home-u-proj/redacted-" in f], files)
+        self.assertNotIn("M" * 20, self.remote_blob_text())
+        self.assertIn("plain text", self.remote_blob_text())
 
     def test_weekly_backup_and_release_skip_a_failed_refresh(self):
         backups = self.tmp / "backups"
@@ -610,6 +613,24 @@ exit 1
 
     def test_a_github_push_goes_when_github_says_private(self):
         self.assertIn("rc=0", self.check("git@github.com:me/my-archive.git", "PRIVATE"))
+
+    def test_a_github_host_spelled_with_a_trailing_dot_is_still_github(self):
+        # sol, second confirm pass: github.com. was "not GitHub" and pushed unchecked
+        for dest in ("git@github.com.:me/public.git", "https://GitHub.COM./me/public", "ssh://git@github.com.:22/me/public.git"):
+            with self.subTest(dest=dest):
+                self.assertIn("rc=1", self.check(dest))
+
+    def test_a_look_alike_github_host_is_refused(self):
+        for dest in ("git@github.com.evil.example:me/r.git", "https://github-mirror.example/me/r"):
+            with self.subTest(dest=dest):
+                out = self.check(dest)
+                self.assertIn("rc=1", out)
+
+    def test_your_own_github_server_goes_only_by_explicit_choice(self):
+        dest = "git@github.example.com:team/archive.git"
+        self.assertIn("rc=1", self.check(dest))
+        self.git("config", "--local", "tape.unverifiedVisibility", dest)
+        self.assertIn("rc=0", self.check(dest))
 
     def test_internal_is_not_private(self):
         out = self.check("git@github.com:me/my-archive.git", "INTERNAL")

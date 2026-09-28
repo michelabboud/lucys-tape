@@ -267,8 +267,13 @@ class ExtractorContainmentTests(Tmp):
         self.assertFalse((archive / "INDEX.md").is_symlink())
 
 
-class SupersededCopyTests(Tmp):
-    """A session written under a new name leaves no older copy behind (0.3.0 gate review)."""
+class ArchiveNameTests(Tmp):
+    """Older versions' names that carry a secret shape are renamed, never deleted; nothing
+    in the archive is removed because another file covers it (0.3.0 gate confirm passes)."""
+
+    # a shape the leak guard matches anywhere, as it would inside a file name ("__sk-..."
+    # is not: "_" is a word character, so a \bsk- pattern never starts there)
+    KEY = "AKIA" + "K" * 16
 
     def run_extract(self):
         ex = load("extract_conversations")
@@ -281,96 +286,90 @@ class SupersededCopyTests(Tmp):
             ex.main()
         return buf.getvalue(), ex.OUT
 
-    def session(self, name, sid, text, project="-p"):
-        recs = [dict(r, sessionId=sid) for r in SESSION]
+    def session(self, name, text, project="-p"):
+        recs = [dict(r) for r in SESSION]
         recs[0] = dict(recs[0], message={"role": "user", "content": [{"type": "text", "text": text}]})
         p = self.root / project / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
 
-    def md_files(self, archive):
-        return sorted(p.name for p in (archive / "conversations").rglob("*.md"))
+    def conv(self):
+        c = self.tmp / "archive" / "conversations"
+        c.mkdir(parents=True, exist_ok=True)
+        return c
 
-    def test_an_old_copy_under_another_name_is_removed(self):
-        self.session("s.jsonl", "abc-1", "a first question about foxes")
-        _, archive = self.run_extract()
-        (only,) = self.md_files(archive)
-        old = archive / "conversations" / "-p" / "2026-08-06__an-older-name__abc-1.md"
-        old.write_bytes((archive / "conversations" / "-p" / only).read_bytes())
+    def test_a_file_named_with_a_secret_shape_is_renamed_byte_for_byte(self):
+        d = self.conv() / "-p"
+        d.mkdir()
+        old = d / f"2026-01-01__{self.KEY}__abc.md"
+        old.write_bytes(b"<!--fab {}-->\nthe content, exactly\n")
+        self.session("s.jsonl", "hello")
         out, _ = self.run_extract()
-        self.assertEqual(self.md_files(archive), [only])
-        self.assertIn("stale copies removed : 1", out)
+        self.assertFalse(old.exists())
+        (renamed,) = [p for p in d.iterdir() if p.name.startswith("redacted-")]
+        self.assertEqual(renamed.read_bytes(), b"<!--fab {}-->\nthe content, exactly\n")
+        self.assertTrue(renamed.name.endswith(".md"))
+        self.assertIn("unsafe names renamed : 1", out)
 
-    def test_an_older_copy_redacted_differently_is_still_removed(self):
-        # the upgrade case: same turns, text masked differently by an older redactor
-        self.session("s.jsonl", "abc-1", "a first question about foxes")
-        _, archive = self.run_extract()
-        (only,) = self.md_files(archive)
-        text = (archive / "conversations" / "-p" / only).read_text()
-        old = archive / "conversations" / "-p" / "2026-08-06__redacted-0123456789ab__abc-1.md"
-        old.write_text(text.replace("foxes", "[an older mask]"))
-        out, _ = self.run_extract()
-        self.assertEqual(self.md_files(archive), [only])
-        self.assertIn("stale copies removed : 1", out)
+    def test_a_folder_named_with_a_secret_shape_is_renamed_with_its_files(self):
+        d = self.conv() / f"proj-{self.KEY}"
+        d.mkdir()
+        (d / "a.md").write_text("kept\n")
+        self.session("s.jsonl", "hello")
+        self.run_extract()
+        self.assertFalse(d.exists())
+        (moved,) = [p for p in self.conv().iterdir() if p.name.startswith("redacted-")]
+        self.assertEqual((moved / "a.md").read_text(), "kept\n")
 
-    def test_a_note_that_shares_an_id_is_never_removed(self):
-        # sol, confirm pass: an imported note "foo.txt" has the id note-foo; a source named
-        # note-foo.jsonl then gets the same id. Different turns: the note must stay.
-        self.session("note-foo.jsonl", "note-foo", "a real session that happens to share the id")
-        notes = self.tmp / "archive" / "conversations" / "notes-prehistory"
-        notes.mkdir(parents=True)
-        note = notes / "2026-01-01__my-note__note-foo.md"
-        note.write_text('<!--fab {"sid":"note-foo","project":"notes-prehistory"}-->\n\n# my note\n'
-                        "\n<!--t role=user kind=note model=- ts=2026-01-01T00:00:00Z-->\n### note\n\nprecious\n")
-        out, _ = self.run_extract()
-        self.assertTrue(note.exists())
-        self.assertIn("copies kept (differ) : 1", out)
-
-    def test_an_older_copy_with_more_turns_is_never_removed(self):
-        # sol, confirm pass: a source that lost turns must not delete the copy that has them
-        self.session("s.jsonl", "abc-1", "a first question about foxes")
-        _, archive = self.run_extract()
-        (only,) = self.md_files(archive)
-        longer = (archive / "conversations" / "-p" / only).read_text() + (
-            "\n<!--t role=user kind=dialogue model=- ts=2026-08-06T09:05:00Z-->\n### You\n\na turn the source lost\n")
-        old = archive / "conversations" / "-p" / "2026-08-06__older__abc-1.md"
-        old.write_text(longer)
-        out, _ = self.run_extract()
-        self.assertTrue(old.exists())
-        self.assertIn("copies kept (differ) : 1", out)
-
-    def test_files_of_sessions_not_written_this_run_are_kept(self):
-        self.session("s.jsonl", "abc-1", "a first question about foxes")
-        _, archive = self.run_extract()
-        conv = archive / "conversations" / "notes-prehistory"
-        conv.mkdir()
-        (conv / "2026-01-01__n__note-x.md").write_text('<!--fab {"sid":"note-x"}-->\n# n\n')
-        (conv / "no-metadata.md").write_text("# hand notes\n")
-        out, _ = self.run_extract()
-        self.assertIn("2026-01-01__n__note-x.md", self.md_files(archive))
-        self.assertIn("no-metadata.md", self.md_files(archive))
-        self.assertIn("stale copies removed : 0", out)
+    def test_an_existing_file_is_never_overwritten(self):
+        d = self.conv() / "-p"
+        d.mkdir()
+        old = d / f"{self.KEY}.md"
+        old.write_text("old\n")
+        import hashlib
+        taken = d / ("redacted-" + hashlib.sha256(old.name.encode()).hexdigest()[:12] + ".md")
+        taken.write_text("already here\n")
+        self.session("s.jsonl", "hello")
+        self.run_extract()
+        self.assertEqual(taken.read_text(), "already here\n")
+        self.assertEqual(old.read_text(), "old\n")
 
     @unittest.skipUnless(POSIX, "symlinks")
-    def test_a_link_carrying_a_written_id_is_left_alone(self):
-        self.session("s.jsonl", "abc-1", "a first question about foxes")
-        _, archive = self.run_extract()
-        (only,) = self.md_files(archive)
-        elsewhere = self.tmp / "elsewhere.md"
-        elsewhere.write_bytes((archive / "conversations" / "-p" / only).read_bytes())
-        (archive / "conversations" / "-p" / "linked.md").symlink_to(elsewhere)
+    def test_nothing_behind_a_linked_folder_is_renamed(self):
+        away = self.tmp / "away"
+        away.mkdir()
+        (away / f"{self.KEY}.md").write_text("not ours\n")
+        (self.conv() / "linked").symlink_to(away)
+        self.session("s.jsonl", "hello")
         self.run_extract()
-        self.assertTrue(elsewhere.exists())
-        self.assertTrue((archive / "conversations" / "-p" / "linked.md").is_symlink())
+        self.assertTrue((away / f"{self.KEY}.md").exists())
 
-    def test_one_session_in_two_sources_is_one_file_and_one_index_row(self):
-        # the id is the file name: the same session reached through two folders
-        self.session("dup-1.jsonl", "dup-1", "short title one", project="-p")
-        self.session("dup-1.jsonl", "dup-1", "a much longer and different title " + "x" * 400, project="-q")
+    def test_copies_of_a_session_under_other_names_are_all_kept(self):
+        # 0.2.23/0.2.24 removed such copies; sol showed that loses data (an id-sharing
+        # imported note, a copy holding turns the new file lacks). Nothing is removed now.
+        self.session("abc-1.jsonl", "a first question about foxes")
+        _, archive = self.run_extract()
+        d = archive / "conversations" / "-p"
+        (only,) = list(d.iterdir())
+        text = only.read_text()
+        older = d / "2026-08-06__older__abc-1.md"
+        older.write_text(text + "\n<!--t role=user kind=dialogue model=- ts=-->\n### You\n\na lost turn\n")
+        notes = archive / "conversations" / "notes-prehistory"
+        notes.mkdir()
+        note = notes / "2026-01-01__n__abc-1.md"
+        note.write_text('<!--fab {"sid":"abc-1"}-->\n# note\n')
+        out, _ = self.run_extract()
+        self.assertTrue(older.exists())
+        self.assertTrue(note.exists())
+        self.assertIn("unsafe names renamed : 0", out)
+
+    def test_one_session_in_two_sources_is_one_index_row(self):
+        # the id is the file name: the same session reached through two folders. Both files
+        # stay (nothing is deleted; BACKLOG), the index and the count list it once.
+        self.session("dup-1.jsonl", "short title one", project="-p")
+        self.session("dup-1.jsonl", "a much longer and different title " + "x" * 400, project="-q")
         out, archive = self.run_extract()
-        self.assertEqual(len(self.md_files(archive)), 1)
-        index = (archive / "INDEX.md").read_text()
-        self.assertEqual(index.count("dup-1"), 1)
+        self.assertEqual((archive / "INDEX.md").read_text().count("dup-1"), 1)
         self.assertIn("conversations written: 1", out)
 
 

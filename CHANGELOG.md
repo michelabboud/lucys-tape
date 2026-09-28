@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.2.25 — 2026-09-29 · rename, never delete; every spelling of GitHub checked
+
+Fixes from the second confirm pass (gpt-5.6-sol, on 0.2.24).
+
+### Fixed
+
+- **0.2.24's cleanup could still lose data.** Matching turn markers do not prove matching text:
+  a copy with different text under the same timestamps was deleted. The cleanup is gone. The
+  problem it was meant to solve was a file an older version named with a secret shape, which
+  the commit gate refused on every run once masking touched it. Such a file or folder is now
+  **renamed** to `redacted-<hash>`, content moved byte for byte, never overwriting anything;
+  nothing in the archive is deleted. On a real machine's archive this renamed nothing (5,576
+  files, twice). Copies of one session under two names stay, as before 0.2.23 (BACKLOG); the
+  index and the count list each session once.
+- The commit gate refused the removal of a path whose name matches the leak guard. Removing
+  a name takes it out of the tree the commit writes, so a removal now passes; a name being
+  added or kept is still refused.
+
+### Security
+
+- **LT-SEC-004: `github.com.` (with the trailing dot of a fully qualified name) was not
+  recognised as GitHub**, so its pushes skipped the privacy check. The host is now read from
+  any address spelling and normalised (case, trailing dots). A host that mentions GitHub
+  without being github.com (a look-alike, or your own GitHub Enterprise server) is refused
+  unless you accept that exact destination with `tape trust --without-gh`.
+- `SECURITY.md` now lists the limits accepted for v0.3.0, as the 0.2.23 entry promised.
+
 ## v0.2.24 — 2026-09-29 · the confirm pass: cleanup that cannot lose data, pushes that need proof
 
 Fixes from the second reviewer's confirm pass on 0.2.23 (gpt-5.6-sol blocked; Fable passed).
