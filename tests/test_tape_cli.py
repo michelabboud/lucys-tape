@@ -198,8 +198,10 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertNotIn("C" * 30, log)
 
 
-TAPE_FUNCS = ("safe_url", "trusted_dest", "github_slug", "github_visibility",
-              "check_destination", "_publish_db_snapshot")
+def tape_library(repo):
+    """Bash that defines every function in tools/tape without running a command:
+    the script up to its dispatch section, exactly as it ships."""
+    return f"source <(sed '/^# ---- dispatch/,$d' '{repo / 'tools' / 'tape'}')"
 
 
 @unittest.skipUnless(BASH and GIT and os.name != "nt", "needs bash and git (POSIX)")
@@ -263,17 +265,12 @@ exit 1
 """)
         self.git("remote", "set-url", "origin", dest)
         self.git("config", "--local", "tape.destination", dest)
-        src = (self.repo / "tools" / "tape").read_text()
-        body = "\n".join(src[src.index(f"{name}() {{"):src.index("\n}\n", src.index(f"{name}() {{")) + 2]
-                         if src[src.index(f"{name}() {{"):].split("\n", 1)[0].rstrip().endswith("{")
-                         else src[src.index(f"{name}() {{"):].split("\n", 1)[0] for name in TAPE_FUNCS)
-        rx = src.split("PUBLIC_UPSTREAM_RX='", 1)[1].split("'", 1)[0]
         (self.repo / "archive").mkdir(exist_ok=True)
         db = self.repo / "archive" / "conversations.db"
         db.write_bytes(b"x")
-        script = (f"PUBLIC_UPSTREAM_RX='{rx}'; ARCHIVE='{self.repo / 'archive'}'; DB='{db}'; LOG=/dev/null\n"
+        script = (f"{tape_library(self.repo)}\nARCHIVE='{self.repo / 'archive'}'; DB='{db}'; LOG=/dev/null\n"
                   "ok(){ echo \"ok $*\"; }; warn(){ echo \"warn $*\"; }; bad(){ echo \"bad $*\"; }; log(){ :; }\n"
-                  f"{body}\n_publish_db_snapshot")
+                  "_publish_db_snapshot")
         r = subprocess.run([BASH, "-c", script], cwd=self.repo, env=self.env, capture_output=True, text=True)
         return r, (calls.read_text() if calls.exists() else "")
 
@@ -282,7 +279,7 @@ exit 1
         self.assertIn("release create", calls, r.stdout + r.stderr)
         for line in calls.splitlines():
             if line.startswith("release"):
-                self.assertIn("--repo me/my-archive", line)
+                self.assertIn("--repo github.com/me/my-archive", line)
 
     def test_release_refused_when_github_says_public(self):
         r, calls = self.run_release("git@github.com:me/my-archive.git", "PUBLIC")
@@ -297,6 +294,51 @@ exit 1
         r, calls = self.run_release("https://github.com/michelabboud/lucys-tape.git", "PRIVATE")
         self.assertNotIn("release create", calls)
         self.assertIn("PUBLIC lucys-tape", r.stdout)
+
+
+    # --- address parsing ---------------------------------------------------------
+    def call(self, fn, arg):
+        script = f"{tape_library(self.repo)}\n{fn} \"$1\"; echo \" rc=$?\""
+        return subprocess.run([BASH, "-c", script, "x", arg], env=self.env, capture_output=True,
+                              text=True).stdout
+
+    def test_github_addresses_in_every_usual_form(self):
+        for url in ("https://github.com/me/r", "https://github.com/me/r/", "https://github.com/me/r.git/",
+                    "https://GitHub.com/Me/R", "https://www.github.com/me/r", "git@github.com:me/r.git",
+                    "ssh://git@github.com:22/me/r.git", "ssh://git@ssh.github.com:443/me/r.git",
+                    "github.com:me/r", "https://user:tok@github.com/me/r.git"):
+            with self.subTest(url=url):
+                self.assertEqual(self.call("github_slug", url).split(" rc=")[0], "me/r")
+
+    def test_github_address_without_a_plain_owner_and_name_is_invalid(self):
+        for url in ("https://github.com/../..", "https://github.com/me/x/../../michelabboud/lucys-tape",
+                    "https://github.com/me", "https://github.com/me/r/extra"):
+            with self.subTest(url=url):
+                self.assertEqual(self.call("github_slug", url).split(" rc=")[0], "INVALID")
+
+    def test_other_hosts_have_no_slug(self):
+        self.assertEqual(self.call("github_slug", "https://gitlab.com/me/r.git").split(" rc=")[0], "")
+
+    def test_the_public_upstream_is_recognised_in_any_case(self):
+        for url in ("https://github.com/MichelAbboud/Lucys-Tape.git", "git@github.com:michelabboud/lucys-tape",
+                    "https://www.github.com/michelabboud/lucys-tape/"):
+            with self.subTest(url=url):
+                self.assertIn("rc=0", self.call("is_public_upstream", url))
+        self.assertIn("rc=1", self.call("is_public_upstream", "git@github.com:me/my-lucys-tape.git"))
+
+    def test_safe_url_masks_every_credential_shape(self):
+        for url, secret in (("https://u:p@ss@host/x", "p@ss"), ("https://host/x?access_token=abc123", "abc123"),
+                            ("http://t0k3n@host/x", "t0k3n")):
+            with self.subTest(url=url):
+                self.assertNotIn(secret, self.call("safe_url", url))
+
+    def test_an_unparseable_github_destination_is_refused(self):
+        dest = "https://github.com/me/x/../../michelabboud/lucys-tape"
+        self.git("remote", "set-url", "origin", dest)
+        self.git("config", "--local", "tape.destination", dest)
+        r = self.update()
+        self.assertIn("not pushed", r.stdout)
+        self.assertIn("plain owner/name", r.stdout)
 
 
 if __name__ == "__main__":

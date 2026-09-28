@@ -26,6 +26,10 @@ Only the latest release on `main` gets fixes.
 
 - Secrets the user commits to the archive by hand, outside `tape`.
 - Anything that needs the attacker to already run code as the archive's owner.
+- Your own transport settings. The trusted destination (`tape trust`) binds the push *address*;
+  an ssh host alias, `core.sshCommand` or `GIT_SSH_COMMAND` you set can still route a matching
+  address elsewhere. It guards against mistakes (a changed remote, a fork, a rewrite rule), not
+  against someone who can already edit your git or ssh configuration.
 
 Known open findings and their status are in `docs/reports/2026-07-16-fable-codex-security-bughunt.md`
 and `BACKLOG.md`.

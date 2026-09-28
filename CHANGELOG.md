@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.2.11 — 2026-09-28 · the destination check's review findings
+
+### Fixed
+
+- **GitHub addresses in common forms were not recognised,** so the "is this repo public?" check
+  was silently skipped for them: a trailing `/` or `.git/`, capital letters, `www.` or `ssh.`
+  hosts, ssh with a port, scp-style without a user. The parser is now strict and complete; a
+  GitHub address that is not a plain `owner/name` (for example one with `..` segments) is
+  refused, not skipped.
+- **The public upstream was matched case-sensitively** on the raw address; it is now compared
+  as a parsed, lower-cased `owner/name`.
+- **`GH_HOST` could send the visibility check and the release to another server.** Every `gh`
+  call now names `github.com/owner/name`.
+- Credential masking covers a password containing `@` and token-like query values.
+- `tape status` shows prominently when pushes are refused and how many commits wait locally.
+
+### Documented
+
+- `SECURITY.md`: the trusted destination binds the push address, not your ssh transport
+  settings.
+
+### Tests
+
+- Address forms, invalid paths, other hosts, the upstream in any case, masking, and an
+  unparseable destination refused. The tests now load the real script (minus its command
+  dispatch) instead of cutting functions out of it.
+
 ## v0.2.10 — 2026-09-28 · the archive goes to one trusted private repo, or nowhere
 
 > **Upgrading from an earlier version:** run `tape trust` once. Until you do, the nightly still
