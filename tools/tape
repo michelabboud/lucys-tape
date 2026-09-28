@@ -9,6 +9,9 @@ set -uo pipefail
 # Git must act on THIS repository and its own index: an inherited GIT_DIR,
 # GIT_WORK_TREE or GIT_INDEX_FILE would point every command somewhere else.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+# Private by default (LT-SEC-006): everything this script and its Python tools create
+# (archive, DB, logs, backups, temporary files) is readable by you alone.
+umask 077
 
 # ---- resolve paths -----------------------------------------------------------
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
@@ -16,7 +19,18 @@ REPO="$(cd "$(dirname "$SELF")/.." && pwd)"
 ARCHIVE="$REPO/archive"
 DB="$ARCHIVE/conversations.db"
 LOG="$ARCHIVE/refresh.log"
-LOCKDIR="${TMPDIR:-/tmp}/lucys-tape-refresh.lock.d"
+# The refresh lock lives in a directory only you can write (LT-SEC-011: a predictable
+# name in the shared /tmp let another account block every refresh). $XDG_RUNTIME_DIR
+# when it is yours and private, else ~/.cache/lucys-tape. The name carries this
+# repo's identity, so two tape clones never block each other.
+_repo_id="$(printf '%s' "$REPO" | cksum | cut -d' ' -f1)"
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -O "$XDG_RUNTIME_DIR" ] \
+   && [ -z "$(find "$XDG_RUNTIME_DIR" -maxdepth 0 -perm -g+w 2>/dev/null)$(find "$XDG_RUNTIME_DIR" -maxdepth 0 -perm -o+w 2>/dev/null)" ]; then
+    RUNDIR="$XDG_RUNTIME_DIR/lucys-tape"
+else
+    RUNDIR="$HOME/.cache/lucys-tape"
+fi
+LOCKDIR="$RUNDIR/refresh-${_repo_id}.lock.d"
 VIEWER="$REPO/tools/conversations_viewer.py"
 EXTRACT="$REPO/tools/extract_conversations.py"
 BUILD="$REPO/tools/build_db.py"
@@ -120,6 +134,13 @@ PY
 # Portable single-instance lock: mkdir is atomic on every POSIX filesystem
 # (flock does not exist on macOS). Stale locks (dead pid) are reclaimed.
 acquire_lock() {
+    mkdir -p "$RUNDIR" 2>/dev/null && chmod 700 "$RUNDIR" 2>/dev/null
+    if [ ! -O "$RUNDIR" ] || [ -L "$RUNDIR" ]; then
+        bad "the lock directory $RUNDIR is not a directory you own — refusing to run"; return 2
+    fi
+    if [ -e "$LOCKDIR" ] && { [ ! -O "$LOCKDIR" ] || [ -L "$LOCKDIR" ]; }; then
+        bad "the refresh lock $LOCKDIR belongs to someone else — refusing to run"; return 2
+    fi
     if mkdir "$LOCKDIR" 2>/dev/null; then
         echo $$ >"$LOCKDIR/pid"
         trap 'rm -rf "$LOCKDIR"; [ -n "${TMP_INDEX:-}" ] && rm -f "$TMP_INDEX"' EXIT
@@ -365,9 +386,15 @@ mask_and_verify() {
 
 # ============================================================================
 cmd_update() {
-    acquire_lock || { say "another refresh is already running — exiting"; exit 0; }
+    local lk=0; acquire_lock || lk=$?
+    [ "$lk" -eq 2 ] && die "refresh lock is not ours — nothing was done"
+    [ "$lk" -ne 0 ] && { say "another refresh is already running — exiting"; exit 0; }
 
     mkdir -p "$ARCHIVE" || die "cannot create $ARCHIVE"
+    # existing installs made before 0.2.17 may be readable by others: take group and
+    # other access off the repo folder (which blocks the way in) and everything in archive/
+    chmod go-rwx "$REPO" "$ARCHIVE" 2>>"$LOG" && chmod -R go-rwx "$ARCHIVE" 2>>"$LOG" \
+        || warn "could not make the archive private (check its ownership)"
     # leftovers of an interrupted DB build: our own side files, always regenerable
     rm -f "$DB.next" "$DB".next.tmp-* "$DB".tmp-* "$DB".next-journal 2>/dev/null
     # preflight runs in a subshell to capture its output, so its `die` only ends that
@@ -465,14 +492,43 @@ _publish_db_snapshot() {
     rm -f "$gz"
 }
 
+# Keep the newest $KEEP_BACKUPS backups (LT-SEC-012: parsing `ls` let a planted file
+# name become an argument to rm). Only regular files you own whose name is exactly
+# lucys-tape-archive-YYYY-MM-DD.tar.gz are candidates; each is removed by exact path.
+rotate_backups() { python3 - "$BACKUP_DIR" "$KEEP_BACKUPS" "$LOG" <<'PY'
+import os, re, stat, sys
+d, keep, logpath = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+name_rx = re.compile(r"lucys-tape-archive-\d{4}-\d{2}-\d{2}\.tar\.gz")
+mine = []
+with os.scandir(d) as it:
+    for e in it:
+        if not name_rx.fullmatch(e.name):
+            continue
+        st = e.stat(follow_symlinks=False)
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
+            mine.append((e.name, e.path))  # the date is in the name: sort by it
+failed = 0
+with open(logpath, "a", encoding="utf-8") as lg:
+    for name, path in sorted(mine, reverse=True)[max(keep, 1):]:
+        try:
+            os.unlink(path)
+            lg.write(f"  backup rotation: removed {name}\n")
+        except OSError as err:
+            failed += 1
+            lg.write(f"  backup rotation: could not remove {name}: {err.strerror}\n")
+sys.exit(1 if failed else 0)
+PY
+}
+
 _do_backup() {
     [ -n "$BACKUP_DIR" ] || { warn "TAPE_BACKUP_DIR unset — skipped durable backup (set it to a second disk/cloud-synced folder)"; return 0; }
+    [ -d "$ARCHIVE/conversations" ] || { warn "no archive yet to back up — run: tape update"; return 1; }
     mkdir -p "$BACKUP_DIR" || { warn "cannot create $BACKUP_DIR"; return 1; }
     mask_and_verify || { warn "leak guard failed — no backup made"; return 1; }
     local stamp; stamp="$(date +%Y-%m-%d)"
     if tar -czf "$BACKUP_DIR/lucys-tape-archive-${stamp}.tar.gz" -C "$REPO" archive tools README.md 2>>"$LOG"; then
         ok "backup: lucys-tape-archive-${stamp}.tar.gz → $BACKUP_DIR"
-        ls -1t "$BACKUP_DIR"/lucys-tape-archive-*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+        rotate_backups || { warn "backup made, but rotating old backups failed (see: tape logs)"; return 1; }
         return 0
     fi
     warn "backup tarball failed"; return 1

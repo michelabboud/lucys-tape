@@ -25,6 +25,7 @@ Usage: python3 tools/import_notes.py <notes_dir> [archive_dir] [--glob 'PATTERN'
 """
 import importlib.util
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -139,4 +140,5 @@ def main():
 
 
 if __name__ == "__main__":
+    os.umask(0o077)  # what we write is private, however we are started (LT-SEC-006)
     main()

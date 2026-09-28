@@ -23,7 +23,7 @@ if [ -d "$DIR/.git" ]; then
     git -C "$DIR" fetch --quiet upstream 2>/dev/null || git -C "$DIR" fetch --quiet origin || true
 else
     say "cloning Lucy's Tape → $DIR"
-    git clone --quiet "$REPO_URL" "$DIR"
+    ( umask 077; git clone --quiet "$REPO_URL" "$DIR" )  # your archive will live here: private
 fi
 
 say "handing off to the setup wizard…"

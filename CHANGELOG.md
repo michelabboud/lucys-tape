@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.17 — 2026-09-28 · private files, a private lock, safe backup rotation
+
+### Security
+
+- **LT-SEC-006: archive files were created with the default permissions,** usually readable by
+  every account on the machine. The CLI and every Python tool now run with `umask 077`; each
+  update also takes group and other access off the repo folder and everything under
+  `archive/`, which hardens installs made before this version. `install.sh` clones privately.
+  (Windows file permissions come with the native Windows edition.)
+- **LT-SEC-011: the refresh lock had a predictable name in the shared `/tmp`,** so another account
+  could create it first and silently stop every refresh. The lock now lives in a folder only you
+  can write (`$XDG_RUNTIME_DIR/lucys-tape` when that is yours and private, otherwise
+  `~/.cache/lucys-tape`), is named after this repo, and a lock or lock folder that is not yours
+  stops the update with an error instead of a silent "already running".
+- **LT-SEC-012: backup rotation parsed `ls` and piped names to `rm`,** so a file planted in the
+  backup folder (for example one named `-rf`) became an argument. Rotation now keeps the newest
+  `TAPE_KEEP_BACKUPS` of the files named exactly `lucys-tape-archive-YYYY-MM-DD.tar.gz` that are
+  regular files you own, removes the rest by exact path, and reports any failure. Symlinks,
+  folders and other names are never touched.
+
+### Fixed
+
+- `tape backup` before the first update reports that there is nothing to back up instead of
+  crashing.
+
 ## v0.2.16 — 2026-09-28 · one session, one set of turns
 
 ### Fixed

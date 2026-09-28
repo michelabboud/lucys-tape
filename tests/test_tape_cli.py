@@ -208,6 +208,69 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertIn("skipped the weekly backup", r.stdout)
         self.assertFalse(backups.exists() and any(backups.iterdir()))
 
+    def test_everything_the_archive_holds_is_private(self):
+        os.chmod(self.repo, 0o755)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(os.stat(self.repo).st_mode & 0o077, 0)
+        for p in [self.repo / "archive", *(self.repo / "archive").rglob("*")]:
+            with self.subTest(p=p.name):
+                self.assertEqual(p.stat().st_mode & 0o077, 0, oct(p.stat().st_mode))
+
+    def test_an_existing_loose_install_is_hardened(self):
+        self.update()
+        loose = next((self.repo / "archive" / "conversations").rglob("*.md"))
+        os.chmod(loose, 0o644)
+        self.add_session("-home-u-proj", "kkkk-1111", "more")
+        self.update()
+        self.assertEqual(loose.stat().st_mode & 0o077, 0)
+
+    def test_the_lock_is_private_and_not_in_tmp(self):
+        self.update()
+        rundir = self.home / ".cache" / "lucys-tape"
+        self.assertTrue(rundir.is_dir())
+        self.assertEqual(rundir.stat().st_mode & 0o077, 0)
+        self.assertFalse(list(self.tmp.glob("lucys-tape-refresh*")))
+
+    def test_a_lock_that_is_not_ours_is_a_visible_failure(self):
+        self.update()
+        rundir = self.home / ".cache" / "lucys-tape"
+        elsewhere = self.tmp / "planted"
+        elsewhere.mkdir()
+        lock_id = subprocess.run(["sh", "-c", f"printf %s '{self.repo}' | cksum | cut -d' ' -f1"],
+                                 capture_output=True, text=True).stdout.strip()
+        (rundir / f"refresh-{lock_id}.lock.d").symlink_to(elsewhere)
+        r = self.update()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not ours", r.stdout)
+
+    def test_backup_rotation_touches_only_its_own_files(self):
+        backups = self.tmp / "backups"
+        backups.mkdir()
+        keep_me = backups / "-rf"
+        keep_me.write_text("planted")
+        target = self.tmp / "victim.txt"
+        target.write_text("must survive")
+        (backups / "lucys-tape-archive-2000-01-01.tar.gz").symlink_to(target)
+        (backups / "lucys-tape-archive-2000-01-02.tar.gz").mkdir()
+        for day in ("01", "02", "03"):
+            (backups / f"lucys-tape-archive-2001-01-{day}.tar.gz").write_bytes(b"old")
+        (self.repo / "README.md").write_text("readme\n")
+        self.update()
+        self.env.update(TAPE_BACKUP_DIR=str(backups), TAPE_KEEP_BACKUPS="2")
+        r = subprocess.run([BASH, str(self.repo / "tools" / "tape"), "backup"], cwd=self.tmp, env=self.env,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        names = sorted(p.name for p in backups.iterdir())
+        self.assertIn("-rf", names)
+        self.assertTrue(target.exists())
+        self.assertIn("lucys-tape-archive-2000-01-01.tar.gz", names)  # a symlink: not ours to rotate
+        self.assertIn("lucys-tape-archive-2000-01-02.tar.gz", names)  # a directory: same
+        dated = [n for n in names if n.startswith("lucys-tape-archive-20") and (backups / n).is_file()
+                 and not (backups / n).is_symlink()]
+        self.assertEqual(len(dated), 2, names)
+        self.assertEqual(os.stat(backups / dated[-1]).st_mode & 0o077, 0)
+
     def test_low_disk_refusal_stops_the_update(self):
         self.env["TAPE_MIN_FREE_GB"] = "999999999"
         head = self.git("rev-parse", "HEAD")

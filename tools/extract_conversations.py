@@ -19,6 +19,7 @@ only ever stores diffable text and never a binary blob.
 """
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -849,4 +850,5 @@ def main():
 
 
 if __name__ == "__main__":
+    os.umask(0o077)  # what we write is private, however we are started (LT-SEC-006)
     main()

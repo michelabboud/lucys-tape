@@ -142,4 +142,5 @@ def build(db_path):
 
 
 if __name__ == "__main__":
+    os.umask(0o077)  # what we write is private, however we are started (LT-SEC-006)
     main()
