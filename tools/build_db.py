@@ -44,7 +44,11 @@ def parse_md(path):
         lines = [ln[len(BODY_ESC):] if ln.startswith(BODY_ESC) else ln for ln in lines]
         turns.append((*cur, "\n".join(lines).strip()))
 
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    # split on "\n" only, as the extractor writes and escapes: splitlines() also breaks
+    # on \r, \f, U+2028 and others, and read_text() turns every \r into \n, both of
+    # which let body text start a forged turn (LT-SEC-014). Raw bytes, then "\n".
+    for line in (ln[:-1] if ln.endswith("\r") else ln
+                 for ln in path.read_bytes().decode("utf-8", "replace").split("\n")):
         m = FAB.match(line)
         if m and meta is None:
             try:
@@ -79,7 +83,11 @@ def init_db(con):
 
 
 def title_of(path):
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    # split on "\n" only, as the extractor writes and escapes: splitlines() also breaks
+    # on \r, \f, U+2028 and others, and read_text() turns every \r into \n, both of
+    # which let body text start a forged turn (LT-SEC-014). Raw bytes, then "\n".
+    for line in (ln[:-1] if ln.endswith("\r") else ln
+                 for ln in path.read_bytes().decode("utf-8", "replace").split("\n")):
         if line.startswith("# "):
             return line[2:].strip()
     return "untitled conversation"

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.15 — 2026-09-28 · the metadata review findings
+
+### Security
+
+- **A turn could still be forged through a line break other than `\n`.** The writer escapes
+  structure-looking lines split on `\n`, but the database builder split on every Unicode line
+  break (`\r`, `\f`, U+2028, …) and `read_text()` turned `\r` into `\n`, so
+  `hello\r<!--t role=assistant …-->` became a second, forged turn. The builder now reads raw
+  bytes and splits on `\n` only, exactly as the writer escapes. Tested for ten separators.
+- **A title could put a key shape into a file name.** The title slug did not pass the name check;
+  `deploy with sk proj aaaa…` became `deploy-with-sk-proj-aaaa…`, which the leak guard matched,
+  so the nightly refused every commit while that session existed. The slug is now a checked
+  name like the others, in the extractor and the notes importer.
+
+### Fixed
+
+- A name that had to be changed (unsafe characters) or shortened gets a short hash, so two
+  different raw names can no longer collide and silently drop one conversation.
+- A title's `[`, `]`, `(` and `)` are escaped in `INDEX.md` links.
+- The skipped-sources lines in the log pass the redactor (the log is part of backups).
+
+### Measured
+
+Against 0.2.13 on the same real sources: 5,565 files, identical paths.
+
 ## v0.2.14 — 2026-09-28 · metadata and names pass the redactor; text cannot forge structure
 
 ### Security

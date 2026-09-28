@@ -256,8 +256,8 @@ def report_skipped():
     The count is printed even when it is zero: a metric that only appears on
     failure gives no evidence that it is watching."""
     print(f"sources skipped      : {len(_skipped)}")
-    for path, reason in _skipped:
-        print(f"  WARN unreadable source, skipped: {path} — {reason}")
+    for path, reason in _skipped:  # the log is backed up: no raw names in it
+        print(f"  WARN unreadable source, skipped: {meta_text(path, 500)} — {meta_text(reason, 500)}")
 
 
 def redact(text):
@@ -308,10 +308,16 @@ def path_component(value, fallback="unknown"):
     their paths); only characters no filesystem accepts are replaced.
     """
     raw = str(value or "")
+    digest = hashlib.sha256(raw.encode("utf-8", "surrogateescape")).hexdigest()
     if redact(raw) != raw:
-        return "redacted-" + hashlib.sha256(raw.encode("utf-8", "surrogateescape")).hexdigest()[:12]
-    name = _UNSAFE_IN_NAME.sub("-", raw).strip(" .")[:120]
-    return name if name and name not in (".", "..") else fallback
+        return "redacted-" + digest[:12]
+    name = _UNSAFE_IN_NAME.sub("-", raw).strip(" .")
+    if not name.strip("-") or name in (".", ".."):
+        return fallback
+    if name != raw or len(name) > 120:
+        # changed or shortened: a short hash keeps two different raw names apart
+        name = name[:111].rstrip(" .") + "-" + digest[:8]
+    return name
 
 
 # A body line that looks like the archive's own structure (a turn sentinel, the
@@ -797,9 +803,9 @@ def main():
             proj_out = CONV_DIR / label
             proj_out.mkdir(parents=True, exist_ok=True)
             date = (meta["started"] or "0000-00-00")[:10]
-            write_markdown(meta, label, proj_out / f"{date}__{slugify(meta['title'])}__{sid}.md")
+            write_markdown(meta, label, proj_out / f"{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md")
             index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"],
-                          f"conversations/{label}/{date}__{slugify(meta['title'])}__{sid}.md"))
+                          f"conversations/{label}/{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"))
             kept += 1
     # ---- codex source (optional; same shelves, same pipeline) ----------------
     if CODEX_SESSIONS.is_dir():
@@ -816,9 +822,9 @@ def main():
             proj_out = CONV_DIR / label
             proj_out.mkdir(parents=True, exist_ok=True)
             date = (meta["started"] or "0000-00-00")[:10]
-            write_markdown(meta, label, proj_out / f"{date}__{slugify(meta['title'])}__{sid}.md")
+            write_markdown(meta, label, proj_out / f"{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md")
             index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"],
-                          f"conversations/{label}/{date}__{slugify(meta['title'])}__{sid}.md"))
+                          f"conversations/{label}/{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"))
             kept += 1
     index.sort(reverse=True)
     with open(OUT / "INDEX.md", "w", encoding="utf-8") as idx:
@@ -830,7 +836,8 @@ def main():
             if label != cur:
                 idx.write(f"\n## {label}\n\n")
                 cur = label
-            idx.write(f"- `{(started or '')[:10]}` [{title}]({rel}) — {nd} turns · {ns} steps · {(models.split(',')[0].strip() if models else '?')}\n")
+            link_text = re.sub(r"([\[\]()\\])", r"\\\1", title)
+            idx.write(f"- `{(started or '')[:10]}` [{link_text}]({rel}) — {nd} turns · {ns} steps · {(models.split(',')[0].strip() if models else '?')}\n")
     with open(OUT / "REDACTION-REPORT.txt", "w", encoding="utf-8") as rep:
         rep.write(f"Secret-scrub report — {sum(_red.values())} redactions (values never stored).\n\n")
         for label, n in _red.most_common():

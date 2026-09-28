@@ -99,7 +99,7 @@ def write_note(path, text):
     fab = {"sid": sid, "started": ts, "ended": ts, "models": "", "branch": "",
            "n_dialogue": 1, "user_turns": 1, "assistant_turns": 0, "n_steps": 0,
            "project": PROJECT}
-    out = OUT_DIR / f"{ts[:10]}__{slugify(title)}__{sid}.md"
+    out = OUT_DIR / f"{ts[:10]}__{path_component(slugify(title), 'untitled')}__{sid}.md"
     with open(out, "w", encoding="utf-8") as f:
         f.write(f"<!--fab {json.dumps(fab, separators=(',', ':'))}-->\n\n")
         f.write(f"# {title}\n\n| | |\n|---|---|\n")
