@@ -591,6 +591,40 @@ exit 1
         self.assertNotIn("release create", calls)
         self.assertIn("PUBLIC", r.stdout)
 
+    # --- pushes when GitHub cannot be asked (0.3.0 gate review) ------------------
+    def check(self, dest, visibility=None):
+        if visibility is not None:
+            (self.tmp / "bin" / "gh").write_text(
+                f"#!/bin/sh\ncase \"$1 $2\" in\n  \"auth status\") exit 0 ;;\n"
+                f"  \"repo view\") echo {visibility} ; exit 0 ;;\nesac\nexit 1\n")
+        self.git("remote", "set-url", "origin", dest)
+        self.git("config", "--local", "tape.destination", dest)
+        script = f"{tape_library(self.repo)}\ncheck_destination; echo \" rc=$?\""
+        return subprocess.run([BASH, "-c", script], cwd=self.repo, env=self.env,
+                              capture_output=True, text=True).stdout
+
+    def test_a_github_push_is_refused_when_privacy_cannot_be_confirmed(self):
+        out = self.check("git@github.com:me/my-archive.git")  # the default fake gh: signed out
+        self.assertIn("rc=1", out)
+        self.assertIn("could not confirm", out)
+
+    def test_a_github_push_goes_when_github_says_private(self):
+        self.assertIn("rc=0", self.check("git@github.com:me/my-archive.git", "PRIVATE"))
+
+    def test_internal_is_not_private(self):
+        out = self.check("git@github.com:me/my-archive.git", "INTERNAL")
+        self.assertIn("rc=1", out)
+        self.assertIn("INTERNAL", out)
+
+    def test_the_without_gh_choice_holds_for_its_destination_only(self):
+        self.git("config", "--local", "tape.unverifiedVisibility", "git@github.com:me/my-archive.git")
+        self.assertIn("rc=0", self.check("git@github.com:me/my-archive.git"))
+        self.assertIn("rc=1", self.check("git@github.com:me/other.git"))
+
+    def test_the_without_gh_choice_never_overrides_a_public_answer(self):
+        self.git("config", "--local", "tape.unverifiedVisibility", "git@github.com:me/my-archive.git")
+        self.assertIn("rc=1", self.check("git@github.com:me/my-archive.git", "PUBLIC"))
+
     def test_release_refused_when_visibility_is_unknown(self):
         r, calls = self.run_release("https://github.com/me/my-archive", "")
         self.assertNotIn("release create", calls)

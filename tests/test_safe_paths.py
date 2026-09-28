@@ -301,6 +301,44 @@ class SupersededCopyTests(Tmp):
         self.assertEqual(self.md_files(archive), [only])
         self.assertIn("stale copies removed : 1", out)
 
+    def test_an_older_copy_redacted_differently_is_still_removed(self):
+        # the upgrade case: same turns, text masked differently by an older redactor
+        self.session("s.jsonl", "abc-1", "a first question about foxes")
+        _, archive = self.run_extract()
+        (only,) = self.md_files(archive)
+        text = (archive / "conversations" / "-p" / only).read_text()
+        old = archive / "conversations" / "-p" / "2026-08-06__redacted-0123456789ab__abc-1.md"
+        old.write_text(text.replace("foxes", "[an older mask]"))
+        out, _ = self.run_extract()
+        self.assertEqual(self.md_files(archive), [only])
+        self.assertIn("stale copies removed : 1", out)
+
+    def test_a_note_that_shares_an_id_is_never_removed(self):
+        # sol, confirm pass: an imported note "foo.txt" has the id note-foo; a source named
+        # note-foo.jsonl then gets the same id. Different turns: the note must stay.
+        self.session("note-foo.jsonl", "note-foo", "a real session that happens to share the id")
+        notes = self.tmp / "archive" / "conversations" / "notes-prehistory"
+        notes.mkdir(parents=True)
+        note = notes / "2026-01-01__my-note__note-foo.md"
+        note.write_text('<!--fab {"sid":"note-foo","project":"notes-prehistory"}-->\n\n# my note\n'
+                        "\n<!--t role=user kind=note model=- ts=2026-01-01T00:00:00Z-->\n### note\n\nprecious\n")
+        out, _ = self.run_extract()
+        self.assertTrue(note.exists())
+        self.assertIn("copies kept (differ) : 1", out)
+
+    def test_an_older_copy_with_more_turns_is_never_removed(self):
+        # sol, confirm pass: a source that lost turns must not delete the copy that has them
+        self.session("s.jsonl", "abc-1", "a first question about foxes")
+        _, archive = self.run_extract()
+        (only,) = self.md_files(archive)
+        longer = (archive / "conversations" / "-p" / only).read_text() + (
+            "\n<!--t role=user kind=dialogue model=- ts=2026-08-06T09:05:00Z-->\n### You\n\na turn the source lost\n")
+        old = archive / "conversations" / "-p" / "2026-08-06__older__abc-1.md"
+        old.write_text(longer)
+        out, _ = self.run_extract()
+        self.assertTrue(old.exists())
+        self.assertIn("copies kept (differ) : 1", out)
+
     def test_files_of_sessions_not_written_this_run_are_kept(self):
         self.session("s.jsonl", "abc-1", "a first question about foxes")
         _, archive = self.run_extract()

@@ -117,7 +117,7 @@ whole thing inside WSL (recommended — it's also where Claude Code is happiest)
 | `tape build` | Rebuild the search DB from Markdown (works on any clone) |
 | `tape backup` | Durable `.tar.gz` snapshot to `TAPE_BACKUP_DIR` (rotated) |
 | `tape install` / `tape uninstall` | Enable/remove the daily systemd timer |
-| `tape trust` | Confirm `origin` as the one **private** repo your archive may be pushed to. Pushes and releases go nowhere else |
+| `tape trust` | Confirm `origin` as the one **private** repo your archive may be pushed to. Pushes and releases go nowhere else. For a GitHub repo, every push first asks GitHub (through `gh`) whether it is private and refuses otherwise; without `gh`, `tape trust --without-gh` accepts that for this one destination |
 | `tape doctor` | Preflight checks |
 | `tape logs` | The refresh log (`-f` to follow) |
 

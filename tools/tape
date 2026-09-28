@@ -106,7 +106,17 @@ check_destination() {
     [ "$slug" = "INVALID" ] && { echo "the destination is a GitHub address without a plain owner/name — refusing"; return 1; }
     if [ -n "$slug" ]; then
         vis="$(github_visibility "$slug")"
-        [ "$vis" = "PUBLIC" ] && { echo "GitHub reports $slug as PUBLIC — refusing"; return 1; }
+        case "$vis" in
+            PRIVATE) ;;
+            "")
+                # No answer (gh missing or signed out). Typing "private" at `tape trust` is
+                # intent, not proof: refuse unless the user accepted this for THIS destination
+                # with `tape trust --without-gh` (0.3.0 gate review).
+                [ "$(git config --local --get tape.unverifiedVisibility 2>/dev/null)" = "$dest" ] || {
+                    echo "could not confirm with GitHub that $slug is private (gh missing or signed out) — run: gh auth login   (or accept it for this destination: tape trust --without-gh)"
+                    return 1; } ;;
+            *) echo "GitHub reports $slug as $vis, not PRIVATE — refusing"; return 1 ;;
+        esac
     fi
     return 0
 }
@@ -346,6 +356,7 @@ ${B}COMMANDS${X}
   ${C}logs${X}        Show the refresh log         (logs -f to follow)
   ${C}doctor${X}      Run the guardrail preflight checks and report
   ${C}trust${X}       Confirm origin as the one PRIVATE repo your archive may be pushed to
+              (--without-gh: push to a GitHub repo even when gh cannot confirm it is private)
   ${C}help${X}        This help
 
 ${B}CONFIG (env overrides)${X}
@@ -809,8 +820,18 @@ record_destination() {
     [ "$slug" = "INVALID" ] && { bad "origin is a GitHub address without a plain owner/name"; return 1; }
     if [ -n "$slug" ]; then
         vis="$(github_visibility "$slug")"
-        [ "$vis" = "PUBLIC" ] && { bad "GitHub reports $slug as PUBLIC — make it private first"; return 1; }
-        [ -z "$vis" ] && warn "could not ask GitHub whether $slug is private (gh missing or signed out) — make sure it is"
+        case "$vis" in
+            PRIVATE|"") ;;
+            *) bad "GitHub reports $slug as $vis — make it private first"; return 1 ;;
+        esac
+        if [ -z "$vis" ]; then
+            if [ "${TAPE_TRUST_WITHOUT_GH:-}" = "1" ]; then
+                git config --local tape.unverifiedVisibility "$urls" || { bad "could not record the destination"; return 1; }
+                warn "recorded WITHOUT asking GitHub whether $slug is private (you chose --without-gh); make sure it is"
+            else
+                warn "could not ask GitHub whether $slug is private (gh missing or signed out): pushes will be refused until it can confirm (gh auth login), or run: tape trust --without-gh"
+            fi
+        fi
     fi
     git config --local tape.destination "$urls" || { bad "could not record the destination"; return 1; }
     ok "trusted destination: $(safe_url "$urls")"
@@ -818,6 +839,11 @@ record_destination() {
 
 cmd_trust() {
     cd "$REPO" || die "cannot cd to $REPO"
+    case "${1:-}" in
+        "") ;;
+        --without-gh) TAPE_TRUST_WITHOUT_GH=1 ;;
+        *) die "unknown option: $1 (tape trust [--without-gh])" ;;
+    esac
     local urls; urls="$(git remote get-url --push --all origin 2>/dev/null)" || die "there is no 'origin' remote — add your PRIVATE repo: git remote add origin <url>"
     say "trust a destination for your archive"
     echo "  origin pushes to: $(safe_url "$urls")"

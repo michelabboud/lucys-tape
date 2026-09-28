@@ -806,29 +806,51 @@ def write_markdown(meta, project, path, root=None):
         write_text(path, out.getvalue(), root or Path(path).parent)
 
 
+TURN_LINE = re.compile(r"^<!--t role=(\S+) kind=(\S+) model=\S* ts=(\S*)-->\s*$")
+
+
+def turn_signature(md):
+    """(role, kind, timestamp) of each turn, in order, or None when the file cannot be read.
+
+    Turn text is left out on purpose: a newer redactor masks more, so an older copy's
+    text can differ while its turns are the same turns. Body lines that look like a turn
+    were escaped by the extractor, so they cannot forge one (LT-SEC-014)."""
+    try:
+        fh, _ = safe_paths.open_source(md, CONV_DIR, follow_links=False)
+        with fh:
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    first, _, _ = text.partition("\n")
+    return first, [m.groups() for m in (TURN_LINE.match(ln) for ln in text.split("\n")) if m]
+
+
 def remove_superseded(written):
-    """Remove the older copies of sessions this run has just written under another name.
+    """Remove older copies of sessions this run has just written under another name.
 
     A newer version can name a conversation differently (0.2.14 hashed names that carried
-    a credential; a title or date can change), and the extractor used to leave the old file
-    behind: a second copy in the archive and the DB, and, when its name carried a credential
-    shape, a file the commit gate refuses on every run once masking touches it. Only
-    sessions written in THIS run are reconciled, so an imported note or a conversation whose
-    source is gone is never touched. The removal is committed like any archive change; the
-    old copy stays in git history.
+    a credential; a title or date can change), and the old file used to stay: a second copy
+    in the archive and the DB, and, when its name carried a credential shape, a file the
+    commit gate refuses on every run once masking touches it.
 
-    written: session id → the path (relative to OUT) it was written to in this run."""
+    An older copy is removed only when the new file provably holds everything it held: the
+    same session id, and its turns (role, kind, timestamp) are the first turns of the new
+    file. Anything else (a note that happens to share an id, a copy with turns the new file
+    lacks) is kept and counted as a conflict. The removal is committed like any archive
+    change; the old copy stays in git history.
+
+    written: session id → the path (relative to OUT) it was written to in this run.
+    Returns (removed, kept_as_conflicts)."""
     keep = {OUT / rel for rel in written.values()}
-    removed = 0
+    new_sigs = {}
+    removed = conflicts = 0
     for md in sorted(CONV_DIR.rglob("*.md")):
         if md in keep:
             continue
-        try:
-            fh, _ = safe_paths.open_source(md, CONV_DIR, follow_links=False)
-            with fh:
-                first = fh.readline(65536).decode("utf-8", "replace")
-        except OSError:
-            continue  # not ours to judge: a link, a folder, unreadable
+        got = turn_signature(md)
+        if got is None:
+            continue  # a link, a folder, unreadable: not ours to judge
+        first, sig = got
         m = re.match(r"<!--fab (\{.*\})-->\s*$", first)
         if not m:
             continue
@@ -836,10 +858,17 @@ def remove_superseded(written):
             sid = json.loads(m.group(1)).get("sid")
         except (json.JSONDecodeError, AttributeError):
             continue
-        if isinstance(sid, str) and sid in written:
+        if not (isinstance(sid, str) and sid in written):
+            continue
+        if sid not in new_sigs:
+            new_sigs[sid] = (turn_signature(OUT / written[sid]) or (None, None))[1]
+        new = new_sigs[sid]
+        if sig and new is not None and new[:len(sig)] == sig:
             md.unlink()
             removed += 1
-    return removed
+        else:
+            conflicts += 1
+    return removed, conflicts
 
 
 def main():
@@ -881,7 +910,7 @@ def main():
             rel = f"conversations/{label}/{date_prefix(meta['started'])}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"
             write_markdown(meta, label, OUT / rel, OUT)
             index[sid] = (meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel)
-    removed = remove_superseded({sid: row[6] for sid, row in index.items()})
+    removed, conflicts = remove_superseded({sid: row[6] for sid, row in index.items()})
     kept = len(index)
     index = sorted(index.values(), reverse=True)
     with io.StringIO() as idx:
@@ -905,6 +934,7 @@ def main():
     print(f"conversations written: {kept}")
     print(f"secret redactions    : {sum(_red.values())}")
     print(f"stale copies removed : {removed}")
+    print(f"copies kept (differ) : {conflicts}")  # same id, turns the new file lacks: never removed
     report_skipped()
 
 

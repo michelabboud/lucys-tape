@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.2.24 — 2026-09-29 · the confirm pass: cleanup that cannot lose data, pushes that need proof
+
+Fixes from the second reviewer's confirm pass on 0.2.23 (gpt-5.6-sol blocked; Fable passed).
+
+### Fixed
+
+- **0.2.23's stale-copy cleanup could delete archive content.** It removed every other file
+  carrying a session id it had just written. An imported note `foo.txt` (id `note-foo`) was
+  deleted when a source named `note-foo.jsonl` appeared, and an older copy holding turns the
+  new file lacked was deleted too. A copy is now removed only when its turns (role, kind,
+  timestamp) are exactly the first turns of the new file; the text may differ, which is the
+  upgrade case (an older redactor masked differently). Every other copy is kept and counted
+  ("copies kept (differ)"). 0.2.23 was never released; no user ran it.
+
+### Security
+
+- **LT-SEC-004: a push to GitHub now needs GitHub to confirm the repo is PRIVATE.** Before,
+  a push went ahead when `gh` was missing or signed out, relying on the `private` you typed at
+  `tape trust`: intent, not proof. The commit is still made locally; only the push waits.
+  INTERNAL is refused like PUBLIC. Without `gh`, `tape trust --without-gh` accepts an
+  unverified push for that one destination; it never overrides a PUBLIC answer and does not
+  carry over to another destination.
+
+### Recorded
+
+- The viewer's cookie reaching other 127.0.0.1 ports stays open for v0.3.0 (SECURITY.md) and
+  is the next task. gpt-5.6-sol argued it should block the release; Fable accepted it as
+  non-blocking. Ruling: v0.2.2 has no viewer authentication at all, so holding back a
+  strictly safer release would leave users on the weaker one.
+
 ## v0.2.23 — 2026-09-29 · fixes from the Phase 1 release-gate review
 
 The release gate had two blind reviews: Claude Fable 5.1 (pass, six should-fixes) and
@@ -46,10 +76,8 @@ acted on; this release fixes the confirmed ones.
 
 ### Accepted, with the reasoning (not fixed in this release)
 
-- **With no `gh` signed in, a push is not checked against GitHub's visibility.** `tape trust`
-  requires you to type `private`, the destination is fixed, and releases still require
-  GitHub to confirm PRIVATE. Making `gh` mandatory for every push would break the promise
-  that `python3` and `git` are all the tape needs. `tape doctor` warns when it cannot check.
+- ~~With no `gh` signed in, a push is not checked against GitHub's visibility.~~ Reversed in
+  0.2.24 after the confirm pass: such pushes are now refused unless accepted per destination.
 - **The viewer's cookie reaches other services on 127.0.0.1**, because browsers do not
   separate cookies by port. A service run by another account on the same machine, which you
   then visit in the same browser, could replay it. Anything running as you can already read
