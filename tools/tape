@@ -37,6 +37,43 @@ FORCE_DB_DAILY="${TAPE_FORCE_DB_DAILY:-0}"
 BACKUP_DIR="${TAPE_BACKUP_DIR:-}"
 LEAK_RX='sk-ant-[A-Za-z0-9]{15}|\bsk-[A-Za-z0-9]{20}|xai-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[0-9]{8,}:[A-Za-z0-9_-]{35}|\b(MII[A-Za-z0-9+/]{3}IBAAK[BC]|MII[A-Za-z0-9+/]{3}IBADANBgkqhkiG9w0BAQEFAASC|MHcCAQEE|MIGkAgEBBD|MIHcAgEBBE|MIGHAgEAMBMGByqGSM49|MIG2AgEAMBAGByqGSM49|MIHuAgEAMBAGByqGSM49|MC4CAQAwBQYDK2V[uw]|MEcCAQAwBQYDK2Vx|MEYCAQAwBQYDK2Vv|b3BlbnNzaC1rZXktdjE)|\bsk-[a-z]{2,12}-[A-Za-z0-9_-]{20}'
 
+# ---- the one place the archive may go (LT-SEC-004) ---------------------------
+# Your conversations may only ever be pushed to, or released on, ONE destination:
+# the private repo you named at `tape init` (or confirmed with `tape trust`),
+# recorded in this clone's local git config as tape.destination. Every push and
+# release checks the remote against it first and refuses on any mismatch.
+PUBLIC_UPSTREAM_RX='github\.com[:/]+michelabboud/lucys-tape(\.git)?/?$'
+
+# A URL with credentials in it (https://user:token@host/…) is printed with them masked.
+safe_url() { printf '%s' "$1" | sed -E 's#(://)[^/@]*@#\1***@#'; }
+trusted_dest() { git config --local --get tape.destination 2>/dev/null; }
+# owner/name for a GitHub URL (https or ssh), empty otherwise
+github_slug() { printf '%s' "$1" | sed -nE 's#^(https://([^/@]*@)?github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+)$#\3#p' | sed -E 's#\.git$##; s#/$##'; }
+# PRIVATE / PUBLIC / INTERNAL as GitHub reports it, or empty when it cannot be asked
+github_visibility() {
+    command -v gh >/dev/null && gh auth status >/dev/null 2>&1 || return 0
+    gh repo view "$1" --json visibility --jq .visibility 2>/dev/null
+}
+
+# Is origin's push destination exactly the trusted one? Prints the reason when not.
+check_destination() {
+    local dest urls n slug vis
+    dest="$(trusted_dest)"
+    [ -n "$dest" ] || { echo "no trusted destination is recorded — run: tape trust"; return 1; }
+    printf '%s' "$dest" | grep -Eq "$PUBLIC_UPSTREAM_RX" && { echo "the recorded destination is the PUBLIC lucys-tape repo — run: tape trust"; return 1; }
+    # get-url applies insteadOf/pushInsteadOf rewrites: this is where a push really goes
+    urls="$(git remote get-url --push --all origin 2>/dev/null)" || { echo "there is no 'origin' remote"; return 1; }
+    n="$(printf '%s\n' "$urls" | grep -c .)"
+    [ "$n" = "1" ] || { echo "origin pushes to ${n} places; it must push to exactly one"; return 1; }
+    [ "$urls" = "$dest" ] || { echo "origin now pushes to $(safe_url "$urls"), not the trusted $(safe_url "$dest") — run: tape trust"; return 1; }
+    slug="$(github_slug "$dest")"
+    if [ -n "$slug" ]; then
+        vis="$(github_visibility "$slug")"
+        [ "$vis" = "PUBLIC" ] && { echo "GitHub reports $slug as PUBLIC — refusing"; return 1; }
+    fi
+    return 0
+}
+
 # ---- pretty output -----------------------------------------------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     B=$'\e[1m'; D=$'\e[2m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; M=$'\e[35m'; X=$'\e[0m'
@@ -223,6 +260,7 @@ ${B}COMMANDS${X}
   ${C}stats${X}       Archive statistics: conversations, projects, models, turns
   ${C}logs${X}        Show the refresh log         (logs -f to follow)
   ${C}doctor${X}      Run the guardrail preflight checks and report
+  ${C}trust${X}       Confirm origin as the one PRIVATE repo your archive may be pushed to
   ${C}help${X}        This help
 
 ${B}CONFIG (env overrides)${X}
@@ -332,7 +370,10 @@ cmd_update() {
     local rc=0
     commit_archive || rc=1
     if [ "$rc" -eq 0 ] && [ "$COMMITTED" = "1" ]; then
-        if git push -q origin "$BRANCH" 2>>"$LOG"; then ok "pushed Markdown diffs"
+        local why
+        if ! why="$(check_destination)"; then
+            warn "not pushed (commit kept locally): $why"; log "push refused: $why"; rc=1
+        elif git push -q origin "refs/heads/$BRANCH:refs/heads/$BRANCH" 2>>"$LOG"; then ok "pushed Markdown diffs"
         else warn "git push failed (local commit preserved) — check your remote: tape doctor"; rc=1; fi
     fi
 
@@ -360,12 +401,21 @@ cmd_build() {
 _publish_db_snapshot() {
     command -v gh >/dev/null || { warn "gh CLI not found — skipped DB release snapshot (optional)"; return 0; }
     gh auth status >/dev/null 2>&1 || { warn "gh not authenticated — skipped DB release snapshot"; return 0; }
+    # A release is published only on the trusted destination, and only once GitHub
+    # itself confirms that repo is PRIVATE. Every gh call names the repo: left to
+    # itself, gh can resolve the public upstream this clone came from (LT-SEC-004).
+    local why slug vis
+    why="$(check_destination)" || { warn "skipped DB release snapshot: $why"; log "release refused: $why"; return 1; }
+    slug="$(github_slug "$(trusted_dest)")"
+    [ -n "$slug" ] || { warn "skipped DB release snapshot: the trusted destination is not a GitHub repo"; return 0; }
+    vis="$(github_visibility "$slug")"
+    [ "$vis" = "PRIVATE" ] || { warn "skipped DB release snapshot: GitHub does not confirm $slug is PRIVATE (got: ${vis:-no answer})"; log "release refused: visibility ${vis:-unknown}"; return 1; }
     local tag="snapshot-$(date +%Y-%m-%d)" gz="$ARCHIVE/conversations.db.gz"
     gzip -c "$DB" > "$gz" 2>>"$LOG" || { warn "gzip of DB failed"; return 1; }
-    if gh release view "$tag" >/dev/null 2>&1; then
-        gh release upload "$tag" "$gz" --clobber >>"$LOG" 2>&1 && ok "DB snapshot updated on release $tag" || { warn "DB asset upload failed"; rm -f "$gz"; return 1; }
+    if gh release view "$tag" --repo "$slug" >/dev/null 2>&1; then
+        gh release upload "$tag" "$gz" --repo "$slug" --clobber >>"$LOG" 2>&1 && ok "DB snapshot updated on release $tag" || { warn "DB asset upload failed"; rm -f "$gz"; return 1; }
     else
-        gh release create "$tag" "$gz" --title "Archive snapshot $tag" \
+        gh release create "$tag" "$gz" --repo "$slug" --title "Archive snapshot $tag" \
             --notes "Compressed SQLite DB ($(du -h "$gz" | cut -f1)). Rebuildable anytime with \`tape build\`." >>"$LOG" 2>&1 \
             && ok "published DB snapshot release $tag" || { warn "release create failed"; rm -f "$gz"; return 1; }
     fi
@@ -490,7 +540,7 @@ cmd_status() {
         ok "branch $(git branch --show-current)  ·  last: $(git log -1 --format='%h %cr' 2>/dev/null)"
         local dirty; dirty="$(git status --porcelain | grep -vc '^$' || true)"
         [ "$dirty" -gt 0 ] && warn "$dirty uncommitted change(s)" || ok "working tree clean"
-        ok "remote: $(git remote get-url origin 2>/dev/null || echo none)"
+        ok "remote: $(safe_url "$(git remote get-url origin 2>/dev/null || echo none)")"
     else bad "no repo"; fi
     echo "${B}Timer${X}"
     if [ "$OS" = "Darwin" ]; then
@@ -570,15 +620,47 @@ cmd_doctor() {
     local origin; origin="$(git remote get-url origin 2>/dev/null || true)"
     if [ -z "$origin" ]; then
         bad "no 'origin' remote — run: tape init"
-    elif echo "$origin" | grep -q "lucys-tape"; then
+    elif printf '%s' "$origin" | grep -Eq "$PUBLIC_UPSTREAM_RX"; then
         warn "origin still points at the public lucys-tape repo — your archive should push to YOUR private repo (run: tape init)"
     else
-        ok "origin: $origin"
+        ok "origin: $(safe_url "$origin")"
+        local why; why="$(check_destination)" && ok "push destination verified (tape.destination)" || bad "push destination: $why"
     fi
     git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 && ok "upstream set: $(git rev-parse --abbrev-ref '@{u}')" || warn "no upstream branch (first push sets it)"
 }
 
 # ============================================================================
+# Record origin's (single, rewritten) push URL as the trusted destination, after
+# refusing the public upstream and, where GitHub can be asked, a public repo.
+record_destination() {
+    local urls n slug vis
+    urls="$(git remote get-url --push --all origin 2>/dev/null)" || { bad "there is no 'origin' remote"; return 1; }
+    n="$(printf '%s\n' "$urls" | grep -c .)"
+    [ "$n" = "1" ] || { bad "origin pushes to ${n} places; it must push to exactly one"; return 1; }
+    printf '%s' "$urls" | grep -Eq "$PUBLIC_UPSTREAM_RX" && { bad "origin is the PUBLIC lucys-tape repo"; return 1; }
+    slug="$(github_slug "$urls")"
+    if [ -n "$slug" ]; then
+        vis="$(github_visibility "$slug")"
+        [ "$vis" = "PUBLIC" ] && { bad "GitHub reports $slug as PUBLIC — make it private first"; return 1; }
+        [ -z "$vis" ] && warn "could not ask GitHub whether $slug is private (gh missing or signed out) — make sure it is"
+    fi
+    git config --local tape.destination "$urls" || { bad "could not record the destination"; return 1; }
+    ok "trusted destination: $(safe_url "$urls")"
+}
+
+cmd_trust() {
+    cd "$REPO" || die "cannot cd to $REPO"
+    local urls; urls="$(git remote get-url --push --all origin 2>/dev/null)" || die "there is no 'origin' remote — add your PRIVATE repo: git remote add origin <url>"
+    say "trust a destination for your archive"
+    echo "  origin pushes to: $(safe_url "$urls")"
+    echo "  Every nightly will push your conversations there. It must be a PRIVATE repo you own."
+    [ -t 0 ] || die "tape trust needs you at the keyboard (it asks for confirmation)"
+    printf "  Type 'private' to confirm: "
+    local yn; read -r yn
+    [ "$yn" = "private" ] || die "not confirmed — nothing recorded"
+    record_destination || die "not recorded"
+}
+
 cmd_init() {
     say "${B}📼 Lucy's Tape — first-time setup${X}"
     echo "  Your AI wakes up every morning with no memory of yesterday."
@@ -592,20 +674,24 @@ cmd_init() {
     # 1. detach from the public repo: your conversations must NEVER push there.
     cd "$REPO" || die "cannot cd to $REPO"
     local origin; origin="$(git remote get-url origin 2>/dev/null || true)"
-    if echo "$origin" | grep -q "lucys-tape"; then
+    if printf '%s' "$origin" | grep -Eq "$PUBLIC_UPSTREAM_RX"; then
         say "step 1 — your PRIVATE archive repo"
         echo "  Your archive will be committed here and pushed to a repo YOU own."
         echo "  Create a PRIVATE empty repo first (e.g. on GitHub: 'my-tape', Private, no README)."
         printf "  Paste its git URL (or leave empty to stay local-only): "
         local url; read -r url
-        git remote rename origin upstream 2>/dev/null && ok "public repo kept as 'upstream' (for tool updates)"
+        git remote rename origin upstream || die "could not rename the public remote to 'upstream' — nothing changed"
+        ok "public repo kept as 'upstream' (for tool updates)"
         if [ -n "$url" ]; then
-            git remote add origin "$url" && ok "origin → $url"
+            printf '%s' "$url" | grep -Eq "$PUBLIC_UPSTREAM_RX" && die "that is the PUBLIC lucys-tape repo — create a PRIVATE one of your own"
+            git remote add origin "$url" || die "could not add origin $(safe_url "$url")"
+            record_destination || die "origin was added but not trusted — fix it, then run: tape trust"
         else
             warn "local-only mode: no pushes until you set one (git remote add origin <url>)"
         fi
     else
-        ok "origin already points at your own repo: ${origin:-'(none — local-only)'}"
+        ok "origin already points at your own repo: $(safe_url "${origin:-(none — local-only)}")"
+        if [ -n "$origin" ] && [ -z "$(trusted_dest)" ]; then cmd_trust || warn "not trusted yet — nightly pushes stay local until: tape trust"; fi
     fi
 
     # 2. put `tape` on the PATH
@@ -658,6 +744,7 @@ case "$cmd" in
     stats)           cmd_stats "$@" ;;
     logs|log)        cmd_logs "$@" ;;
     doctor|check)    cmd_doctor "$@" ;;
+    trust)           cmd_trust "$@" ;;
     help|-h|--help)  cmd_help ;;
     *) bad "unknown command: $cmd"; echo; cmd_help; exit 2 ;;
 esac

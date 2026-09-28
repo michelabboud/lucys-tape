@@ -22,8 +22,9 @@ BASH = shutil.which("bash")
 GIT = shutil.which("git")
 
 
-@unittest.skipUnless(BASH and GIT and os.name != "nt", "needs bash and git (POSIX)")
-class TapeUpdateTests(unittest.TestCase):
+class TapeRepoCase(unittest.TestCase):
+    """A throwaway tape clone with a local remote; the tests live in subclasses."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="tape-cli-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -50,6 +51,7 @@ class TapeUpdateTests(unittest.TestCase):
         self.git("commit", "-q", "-m", "tool")
         self.git("remote", "add", "origin", str(self.remote))
         self.git("push", "-q", "origin", "main")
+        self.git("config", "--local", "tape.destination", str(self.remote))
         self.add_session("-home-u-proj", "aaaa-1111", "hello tape")
 
     def git(self, *args, cwd=None):
@@ -76,6 +78,10 @@ class TapeUpdateTests(unittest.TestCase):
         return set(self.git("--git-dir", str(self.remote), "ls-tree", "-r", "--name-only", "main",
                             cwd=self.tmp).split())
 
+
+
+@unittest.skipUnless(BASH and GIT and os.name != "nt", "needs bash and git (POSIX)")
+class TapeUpdateTests(TapeRepoCase):
     def test_update_commits_and_pushes_only_the_archive(self):
         r = self.update()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -190,6 +196,107 @@ class TapeUpdateTests(unittest.TestCase):
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
         log = (self.repo / "archive" / "refresh.log").read_text()
         self.assertNotIn("C" * 30, log)
+
+
+TAPE_FUNCS = ("safe_url", "trusted_dest", "github_slug", "github_visibility",
+              "check_destination", "_publish_db_snapshot")
+
+
+@unittest.skipUnless(BASH and GIT and os.name != "nt", "needs bash and git (POSIX)")
+class DestinationTests(TapeRepoCase):
+    """LT-SEC-004: the archive goes to one trusted private destination, or nowhere."""
+
+    def remote_commits(self):
+        return int(self.git("--git-dir", str(self.remote), "rev-list", "--count", "main", cwd=self.tmp))
+
+    def assert_not_pushed(self, r, reason):
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not pushed", r.stdout)
+        self.assertIn(reason, r.stdout)
+        self.assertEqual(self.remote_commits(), 1)
+
+    def test_no_recorded_destination_means_no_push(self):
+        self.git("config", "--local", "--unset", "tape.destination")
+        r = self.update()
+        self.assert_not_pushed(r, "tape trust")
+        self.assertEqual(self.git("log", "-1", "--format=%s").split()[0], "chore:")  # kept locally
+
+    def test_a_changed_push_url_is_refused(self):
+        other = self.tmp / "other.git"
+        self.git("init", "-q", "--bare", str(other), cwd=self.tmp)
+        self.git("remote", "set-url", "--push", "origin", str(other))
+        self.assert_not_pushed(self.update(), "not the trusted")
+        self.assertEqual(self.git("--git-dir", str(other), "rev-list", "--all", cwd=self.tmp), "")
+
+    def test_an_insteadof_rewrite_is_seen(self):
+        other = self.tmp / "other.git"
+        self.git("init", "-q", "--bare", str(other), cwd=self.tmp)
+        self.git("config", "--local", f"url.{other}.pushInsteadOf", str(self.remote))
+        self.assert_not_pushed(self.update(), "not the trusted")
+
+    def test_two_push_urls_are_refused(self):
+        self.git("remote", "set-url", "--add", "--push", "origin", str(self.remote))
+        self.git("remote", "set-url", "--add", "--push", "origin", str(self.tmp / "x.git"))
+        self.assert_not_pushed(self.update(), "exactly one")
+
+    def test_credentials_in_urls_are_never_printed(self):
+        url = "https://user:s3cr3t-t0ken@example.invalid/me/private.git"
+        self.git("remote", "set-url", "--push", "origin", url)
+        r = self.update()
+        self.assertNotIn("s3cr3t-t0ken", r.stdout + r.stderr)
+        self.assertNotIn("s3cr3t-t0ken", (self.repo / "archive" / "refresh.log").read_text())
+        self.assertIn("***@example.invalid", r.stdout)
+
+    # --- releases: run the functions alone with a scripted gh ------------------
+    def run_release(self, dest, visibility):
+        calls = self.tmp / "gh-calls.txt"
+        gh = self.tmp / "bin" / "gh"
+        gh.write_text(f"""#!/bin/sh
+echo "$@" >> {calls}
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo view") echo {visibility} ; exit 0 ;;
+  "release view") exit 1 ;;
+  "release create") exit 0 ;;
+esac
+exit 1
+""")
+        self.git("remote", "set-url", "origin", dest)
+        self.git("config", "--local", "tape.destination", dest)
+        src = (self.repo / "tools" / "tape").read_text()
+        body = "\n".join(src[src.index(f"{name}() {{"):src.index("\n}\n", src.index(f"{name}() {{")) + 2]
+                         if src[src.index(f"{name}() {{"):].split("\n", 1)[0].rstrip().endswith("{")
+                         else src[src.index(f"{name}() {{"):].split("\n", 1)[0] for name in TAPE_FUNCS)
+        rx = src.split("PUBLIC_UPSTREAM_RX='", 1)[1].split("'", 1)[0]
+        (self.repo / "archive").mkdir(exist_ok=True)
+        db = self.repo / "archive" / "conversations.db"
+        db.write_bytes(b"x")
+        script = (f"PUBLIC_UPSTREAM_RX='{rx}'; ARCHIVE='{self.repo / 'archive'}'; DB='{db}'; LOG=/dev/null\n"
+                  "ok(){ echo \"ok $*\"; }; warn(){ echo \"warn $*\"; }; bad(){ echo \"bad $*\"; }; log(){ :; }\n"
+                  f"{body}\n_publish_db_snapshot")
+        r = subprocess.run([BASH, "-c", script], cwd=self.repo, env=self.env, capture_output=True, text=True)
+        return r, (calls.read_text() if calls.exists() else "")
+
+    def test_release_goes_only_to_a_repo_github_confirms_private(self):
+        r, calls = self.run_release("git@github.com:me/my-archive.git", "PRIVATE")
+        self.assertIn("release create", calls, r.stdout + r.stderr)
+        for line in calls.splitlines():
+            if line.startswith("release"):
+                self.assertIn("--repo me/my-archive", line)
+
+    def test_release_refused_when_github_says_public(self):
+        r, calls = self.run_release("git@github.com:me/my-archive.git", "PUBLIC")
+        self.assertNotIn("release create", calls)
+        self.assertIn("PUBLIC", r.stdout)
+
+    def test_release_refused_when_visibility_is_unknown(self):
+        r, calls = self.run_release("https://github.com/me/my-archive", "")
+        self.assertNotIn("release create", calls)
+
+    def test_release_never_targets_the_public_upstream(self):
+        r, calls = self.run_release("https://github.com/michelabboud/lucys-tape.git", "PRIVATE")
+        self.assertNotIn("release create", calls)
+        self.assertIn("PUBLIC lucys-tape", r.stdout)
 
 
 if __name__ == "__main__":

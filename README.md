@@ -110,13 +110,14 @@ whole thing inside WSL (recommended — it's also where Claude Code is happiest)
 | Command | What it does |
 |---|---|
 | `tape init` | One-time setup wizard: private remote, first extraction, timer |
-| `tape update` | Refresh now: extract → build DB → leak-guard → commit & push |
+| `tape update` | Refresh now: extract → build DB → leak-guard → commit → push to the trusted repo only |
 | `tape serve` / `tape stop` | Start/stop the local viewer (`:8124`) |
 | `tape status` | Timer, repo, disk, last-run health at a glance |
 | `tape stats` | Archive statistics: conversations, projects, models, turns |
 | `tape build` | Rebuild the search DB from Markdown (works on any clone) |
 | `tape backup` | Durable `.tar.gz` snapshot to `TAPE_BACKUP_DIR` (rotated) |
 | `tape install` / `tape uninstall` | Enable/remove the daily systemd timer |
+| `tape trust` | Confirm `origin` as the one **private** repo your archive may be pushed to. Pushes and releases go nowhere else |
 | `tape doctor` | Preflight checks |
 | `tape logs` | The refresh log (`-f` to follow) |
 

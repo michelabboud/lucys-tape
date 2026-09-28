@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.10 — 2026-09-28 · the archive goes to one trusted private repo, or nowhere
+
+> **Upgrading from an earlier version:** run `tape trust` once. Until you do, the nightly still
+> extracts and commits, but keeps the commit local and says why.
+
+### Security
+
+- **LT-SEC-004: pushes and releases were not bound to your private repo.** The weekly database
+  snapshot called `gh release` without naming a repo, and in a clone of this project `gh` can
+  resolve the public upstream; pushes went wherever `origin` pointed that night. Now:
+  - `tape init` records the private repo you give it as the one trusted destination
+    (`tape.destination` in the clone's local git config); `tape trust` does the same, with
+    confirmation, for an existing setup.
+  - Before every push, origin's push address, after git applies any `insteadOf` /
+    `pushInsteadOf` rewrite, must be exactly one address, equal to the trusted one, and not the
+    public upstream; where GitHub can be asked, it must not report the repo as public.
+    Otherwise the commit stays local and the update says why.
+  - A release is published only on the trusted destination, only after GitHub confirms that
+    repo is **private**, and every `gh` call names it with `--repo`.
+  - Setup stops if renaming the public remote or adding yours fails, instead of carrying on.
+- **LT-SEC-013: credentials in a remote address were printed verbatim.** Any address with a
+  user or token in it (`https://user:token@host/…`) is now shown masked in output and logs.
+
+### Fixed
+
+- Setup and `tape doctor` treated any remote whose address contained "lucys-tape" as the public
+  repo, so a private repo named, say, `my-lucys-tape` was renamed to `upstream`. They now match
+  the public repo's exact address.
+
+### Tests
+
+- 9 new tests: no recorded destination, a changed push URL, a `pushInsteadOf` rewrite, two push
+  URLs, masked credentials, and releases against a scripted `gh` (private: published with
+  `--repo`; public, unknown or the public upstream: refused). All fail on 0.2.9.
+
 ## v0.2.9 — 2026-09-28 · the archive gate's re-review findings
 
 ### Fixed
