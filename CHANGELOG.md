@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.2.8 — 2026-09-28 · the archive commit is built on a private index
+
+The deep review of 0.2.7 showed that `git commit` still committed whatever the index held
+when it ran, after the check: a `pre-commit` hook that ran `git add`, or anything staged during
+a long extraction, was pushed.
+
+### Security
+
+- **The archive commit never goes through the user's index or commit hooks.** The update
+  builds it in a private temporary index (`read-tree HEAD`, `add -A -- archive/`), checks it,
+  and records it with `write-tree`, `commit-tree` and a compare-and-swap `update-ref` that
+  refuses if the branch moved meanwhile. Work the user has staged stays staged and is never
+  committed; no hook can add a file. The pre-staged refusal from 0.2.7 is no longer needed and
+  is gone.
+- **The byte scan reads the exact staged objects.** It takes object ids from
+  `git diff --cached --raw -z` and streams them through `git cat-file --batch`, instead of
+  asking for paths, which a file name ending in a newline could redirect to another file.
+  The allow-list is a full match; gitlinks and other non-file entries are refused.
+- **A stray file under `archive/` is skipped, not fatal:** it is left uncommitted and reported,
+  so one misplaced file no longer stops every nightly run.
+
+### Measured
+
+10,000 staged files (157 MB): the check takes 5.3 s and 20 MB of memory, against 24.5 s and
+252 MB for the 0.2.7 version on the reviewer's run (it held every blob at once).
+
 ## v0.2.7 — 2026-09-28 · the nightly commit holds only the archive
 
 ### Security

@@ -93,15 +93,43 @@ class TapeUpdateTests(unittest.TestCase):
         self.assertNotIn("extracting", r.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
 
-    def test_refuses_when_something_is_already_staged(self):
+    def test_work_already_staged_stays_staged_and_is_not_committed(self):
         (self.repo / "notes.txt").write_text("my own work in progress\n")
         self.git("add", "notes.txt")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("notes.txt", self.remote_files())
+        self.assertEqual(self.git("diff", "--cached", "--name-only").split(), ["notes.txt"])
+        self.assertEqual(self.git("status", "--porcelain", "--", "archive/"), "")
+
+    def test_a_commit_hook_cannot_add_files(self):
+        hook = self.repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho leaked > secret-notes.txt\ngit add secret-notes.txt\n")
+        hook.chmod(0o755)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("secret-notes.txt", self.remote_files())
+
+    def test_a_stray_file_under_archive_is_skipped_not_fatal(self):
+        self.update()
+        (self.repo / "archive" / "my-notes.txt").write_text("private\n")
+        self.add_session("-home-u-proj", "dddd-4444", "second")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("left uncommitted", r.stdout)
+        self.assertNotIn("archive/my-notes.txt", self.remote_files())
+        self.assertTrue(any("dddd-4444" in p for p in self.remote_files()))
+
+    def test_a_newline_in_a_file_name_cannot_hide_its_content(self):
+        self.update()
+        d = self.repo / "archive" / "conversations" / "-home-u-proj"
+        (d / "evil.md").write_text("clean\n")
+        (d / "evil.md\n").write_text("key sk-proj-" + "D" * 30 + "\n")
         head = self.git("rev-parse", "HEAD")
         r = self.update()
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("already has staged changes", r.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertEqual(self.git("diff", "--cached", "--name-only").split(), ["notes.txt"])
+        self.assertNotIn("D" * 30, self.git("--git-dir", str(self.remote), "log", "-p", "--all", cwd=self.tmp))
+        self.assertNotEqual(r.returncode, 0)
 
     def test_unstaged_work_outside_the_archive_is_left_alone(self):
         (self.repo / "notes.txt").write_text("untracked scratch\n")
@@ -122,7 +150,7 @@ class TapeUpdateTests(unittest.TestCase):
         head = self.git("rev-parse", "HEAD")
         r = self.update()
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("staged-content check", r.stdout)
+        self.assertIn("nothing committed", r.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
         log = (self.repo / "archive" / "refresh.log").read_text()

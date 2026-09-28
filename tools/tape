@@ -110,40 +110,81 @@ print(f"{files} {hits}")
 PY
 }
 
-# Staged-content gate (LT-SEC-003). The update may commit ONLY what it generated:
-# archive/INDEX.md, archive/REDACTION-REPORT.txt and archive/conversations/**.md. Every staged path is checked
-# against that list and against LEAK_RX, and every staged BLOB (the exact bytes git
-# will commit, not the working tree) is scanned. Prints the number of violations;
+# Archive commit gate (LT-SEC-003). Run with GIT_INDEX_FILE pointing at a PRIVATE
+# index that holds HEAD plus `git add -A -- archive/`. Only our own output may be
+# committed: archive/INDEX.md, archive/REDACTION-REPORT.txt, archive/conversations/**.md.
+# Anything else under archive/ is put back to HEAD in the private index and reported
+# (a stray file never blocks the nightly). What remains is checked: no gitlinks, no
+# path matching LEAK_RX, and every blob (the exact bytes git will commit, fetched by
+# object id and streamed) scanned with LEAK_RX. Prints "<problems> <skipped> <changes>";
 # details go to the log with any matching name withheld.
-staged_guard() { python3 - "$LEAK_RX" "$LOG" <<'PY'
+archive_gate() { python3 - "$LEAK_RX" "$LOG" <<'PY'
 import re, subprocess, sys
 rx, logpath = re.compile(sys.argv[1], re.ASCII), sys.argv[2]
-ALLOWED = re.compile(r"^archive/(INDEX\.md|REDACTION-REPORT\.txt|conversations/.+\.md)$")
-names = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
-                       check=True, capture_output=True).stdout.decode("utf-8", "surrogateescape")
-paths = [p for p in names.split("\0") if p]
-bad = []
-for n, p in enumerate(paths, 1):
-    if rx.search(p):
-        bad.append(f"staged path #{n} matches the leak guard (name withheld)")
-    elif not ALLOWED.match(p):
-        bad.append(f"staged path outside the archive: {p}")
-live = [p for p in paths if subprocess.run(["git", "cat-file", "-e", f":{p}"], capture_output=True).returncode == 0]
-if live:
-    out = subprocess.run(["git", "cat-file", "--batch"], input="".join(f":{p}\n" for p in live).encode("utf-8", "surrogateescape"),
+ALLOWED = re.compile(r"archive/(INDEX\.md|REDACTION-REPORT\.txt|conversations/[^\n\r]+\.md)")
+enc = lambda b: b.decode("utf-8", "surrogateescape")
+
+
+def raw_diff():
+    out = subprocess.run(["git", "diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev"],
                          check=True, capture_output=True).stdout
-    pos = 0
-    for n, p in enumerate(live, 1):
-        header_end = out.index(b"\n", pos)
-        size = int(out[pos:header_end].split()[2])
-        blob = out[header_end + 1:header_end + 1 + size].decode("utf-8", "replace")
-        pos = header_end + 1 + size + 1
-        if rx.search(blob):
-            bad.append(f"staged content #{n} matches the leak guard" + ("" if rx.search(p) else f": {p}"))
+    parts, entries = out.split(b"\0"), []
+    for i in range(0, len(parts) - 1, 2):
+        meta, path = parts[i].split(), enc(parts[i + 1])
+        entries.append((meta[1].decode(), meta[3].decode(), meta[4].decode(), path))
+    return entries  # (new mode, new object id, status, path)
+
+
+def label(n, path):
+    return f"#{n} (name matches the leak guard; withheld)" if rx.search(path) else path
+
+
+log, problems = [], 0
+stray = [e for e in raw_diff() if not ALLOWED.fullmatch(e[3])]
+if stray:
+    subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                   input=b"".join(e[3].encode("utf-8", "surrogateescape") + b"\0" for e in stray), check=True)
+    for n, e in enumerate(stray, 1):
+        log.append(f"skipped (not archive output, left uncommitted): {label(n, e[3])}")
+entries = raw_diff()
+if any(not ALLOWED.fullmatch(e[3]) for e in entries):
+    log.append("a stray path could not be unstaged")
+    problems += 1
+blobs = []
+for n, (mode, oid, status, path) in enumerate(entries, 1):
+    if rx.search(path):
+        log.append(f"staged path {label(n, path)} matches the leak guard")
+        problems += 1
+    if status == "D":
+        continue
+    if mode != "100644" and mode != "100755":
+        log.append(f"staged entry {label(n, path)} is not a regular file (mode {mode})")
+        problems += 1
+        continue
+    blobs.append((n, oid, path))
+if blobs:
+    cat = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    for n, oid, path in blobs:  # one request, one answer: memory stays at one blob
+        cat.stdin.write(oid.encode() + b"\n")
+        cat.stdin.flush()
+        header = cat.stdout.readline().split()
+        if len(header) != 3 or header[0].decode() != oid or header[1] != b"blob":
+            log.append(f"could not read staged blob for {label(n, path)}")
+            problems += 1
+            break
+        data = cat.stdout.read(int(header[2]))
+        cat.stdout.read(1)
+        if rx.search(data.decode("utf-8", "replace")):
+            log.append(f"staged content of {label(n, path)} matches the leak guard")
+            problems += 1
+    cat.stdin.close()
+    if cat.wait() != 0:
+        log.append("git cat-file failed")
+        problems += 1
 with open(logpath, "a", encoding="utf-8") as lg:
-    for b in bad:
-        lg.write(f"  staged-guard: {b}\n")
-print(len(bad))
+    for line in log:
+        lg.write(f"  archive-gate: {line}\n")
+print(problems, len(stray), len(entries))
 PY
 }
 
@@ -192,6 +233,41 @@ preflight() {
     echo "$f"
 }
 
+# Build and record the archive commit on a private index. Sets COMMITTED=1 when a
+# commit was made and BRANCH to the branch it went on. Returns non-zero on any failure,
+# leaving HEAD, the user's index and the working tree as they were.
+commit_archive() {
+    COMMITTED=0
+    BRANCH="$(git symbolic-ref --quiet --short HEAD)" || { bad "HEAD is detached — check out your archive branch first"; log "archive commit: detached HEAD"; return 1; }
+    local parent idx tree commit gate problems skipped changes
+    parent="$(git rev-parse --verify --quiet HEAD)" || parent=""
+    idx="$(mktemp "${TMPDIR:-/tmp}/lucys-tape-index.XXXXXX")" || { bad "cannot create a temporary index"; return 1; }
+    if [ -n "$parent" ]; then GIT_INDEX_FILE="$idx" git read-tree "$parent" 2>>"$LOG"
+    else GIT_INDEX_FILE="$idx" git read-tree --empty 2>>"$LOG"; fi \
+        && GIT_INDEX_FILE="$idx" git add -A -- archive/ 2>>"$LOG" \
+        && gate="$(GIT_INDEX_FILE="$idx" archive_gate)" \
+        || { rm -f "$idx"; bad "could not stage the archive — nothing committed (see: tape logs)"; log "archive commit: staging failed"; return 1; }
+    read -r problems skipped changes <<<"$gate"
+    [ "${skipped:-0}" -gt 0 ] && warn "${skipped} file(s) under archive/ are not archive output and were left uncommitted (see: tape logs)"
+    if [ "${problems:-1}" != "0" ]; then
+        rm -f "$idx"; bad "archive check: ${problems} problem(s) — nothing committed (see: tape logs)"
+        log "archive commit: ${problems} problem(s), nothing committed"; return 1
+    fi
+    if [ "${changes:-0}" = "0" ]; then rm -f "$idx"; ok "no changes to commit"; return 0; fi
+    tree="$(GIT_INDEX_FILE="$idx" git write-tree 2>>"$LOG")"; rm -f "$idx"
+    [ -n "$tree" ] || { bad "git write-tree failed — nothing committed"; return 1; }
+    commit="$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "chore: refresh archive ($(date -u +%Y-%m-%dT%H:%MZ))" 2>>"$LOG")" \
+        && [ -n "$commit" ] || { bad "git commit-tree failed — nothing committed"; return 1; }
+    # compare-and-swap: refuses if the branch moved while we worked
+    # (an empty old value means "must not exist yet", for a first commit)
+    git update-ref -m "tape: refresh archive" "refs/heads/$BRANCH" "$commit" "$parent" 2>>"$LOG" \
+        || { bad "the branch moved during the refresh — nothing committed, run again"; log "archive commit: update-ref refused"; return 1; }
+    # the user's index still lists the old archive blobs; point its archive entries at
+    # the new commit so `git status` stays clean (their other staged work is untouched)
+    git reset -q -- archive/ 2>>"$LOG" || warn "could not refresh the index for archive/ (run: git reset -- archive/)"
+    COMMITTED=1; ok "committed ${changes} archive change(s)"
+}
+
 # ============================================================================
 cmd_update() {
     acquire_lock || { say "another refresh is already running — exiting"; exit 0; }
@@ -202,9 +278,6 @@ cmd_update() {
     local free_gb; free_gb="$(preflight)" || { echo "$free_gb"; exit 1; }
     say "refresh starting (${free_gb}GB free)"; log "refresh starting (${free_gb}GB free)"
     cd "$REPO" || die "cannot cd to repo"
-    # Commit only our own output (LT-SEC-003): if anything is already staged, it is
-    # someone's work in progress, and `git commit` would sweep it into the archive commit.
-    git diff --cached --quiet 2>>"$LOG" || die "the git index already has staged changes — commit or unstage them first (refusing to commit work that is not the archive's)"
 
     # Ratchet: remember the archive size BEFORE this refresh. A rebuilt archive
     # that shrinks below half the previous count means the extractor (or the
@@ -240,20 +313,16 @@ cmd_update() {
     fi
     ok "leak guard passed (output verified clean)"
 
-    # 3. commit ONLY the diffable Markdown (the DB is git-ignored, never committed)
-    local rc=0 bad
-    git add -A -- archive/ 2>>"$LOG" || { git reset -q -- archive/ 2>>"$LOG"; die "git add failed — nothing committed (see: tape logs)"; }
-    bad="$(staged_guard)" || { git reset -q -- archive/ 2>>"$LOG"; die "staged-content check crashed — nothing committed (see: tape logs)"; }
-    if [ "${bad:-1}" != "0" ]; then
-        git reset -q -- archive/ 2>>"$LOG"
-        die "staged-content check: ${bad} problem(s) — nothing committed (see: tape logs)"
-    fi
-    if git diff --cached --quiet; then
-        ok "no changes to commit"
-    elif git commit -q -m "chore: refresh archive ($(date -u +%Y-%m-%dT%H:%MZ))"; then
-        if git push -q origin "$(git branch --show-current)" 2>>"$LOG"; then ok "pushed Markdown diffs"
+    # 3. commit ONLY the archive's own output (LT-SEC-003). The commit is built in a
+    # private index and written with commit-tree + update-ref: the user's staging area
+    # is never read or swept in, no commit hook can add files, and nothing staged
+    # meanwhile can ride along. The DB is git-ignored and never committed.
+    local rc=0
+    commit_archive || rc=1
+    if [ "$rc" -eq 0 ] && [ "$COMMITTED" = "1" ]; then
+        if git push -q origin "$BRANCH" 2>>"$LOG"; then ok "pushed Markdown diffs"
         else warn "git push failed (local commit preserved) — check your remote: tape doctor"; rc=1; fi
-    else warn "git commit failed"; rc=1; fi
+    fi
 
     # 4. weekly (Sundays): durable backup + compressed-DB GitHub release snapshot
     local weekly=0
