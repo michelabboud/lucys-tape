@@ -6,6 +6,9 @@
 # │  Linux/WSL (systemd timer) + macOS (launchd). Python tools run anywhere. │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 set -uo pipefail
+# Git must act on THIS repository and its own index: an inherited GIT_DIR,
+# GIT_WORK_TREE or GIT_INDEX_FILE would point every command somewhere else.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 
 # ---- resolve paths -----------------------------------------------------------
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
@@ -61,7 +64,7 @@ PY
 acquire_lock() {
     if mkdir "$LOCKDIR" 2>/dev/null; then
         echo $$ >"$LOCKDIR/pid"
-        trap 'rm -rf "$LOCKDIR"' EXIT
+        trap 'rm -rf "$LOCKDIR"; [ -n "${TMP_INDEX:-}" ] && rm -f "$TMP_INDEX"' EXIT
         return 0
     fi
     local pid; pid="$(cat "$LOCKDIR/pid" 2>/dev/null)"
@@ -119,7 +122,7 @@ PY
 # object id and streamed) scanned with LEAK_RX. Prints "<problems> <skipped> <changes>";
 # details go to the log with any matching name withheld.
 archive_gate() { python3 - "$LEAK_RX" "$LOG" <<'PY'
-import re, subprocess, sys
+import os, re, subprocess, sys
 rx, logpath = re.compile(sys.argv[1], re.ASCII), sys.argv[2]
 ALLOWED = re.compile(r"archive/(INDEX\.md|REDACTION-REPORT\.txt|conversations/[^\n\r]+\.md)")
 enc = lambda b: b.decode("utf-8", "surrogateescape")
@@ -140,14 +143,20 @@ def label(n, path):
 
 
 log, problems = [], 0
-stray = [e for e in raw_diff() if not ALLOWED.fullmatch(e[3])]
+REGULAR = ("100644", "100755")
+# Not archive output: a name outside the allow-list, or a symlink / gitlink / other
+# non-file under an allowed name. Deletions of such entries are strays too.
+stray = [e for e in raw_diff()
+         if not ALLOWED.fullmatch(e[3]) or (e[2] != "D" and e[0] not in REGULAR)]
 if stray:
+    # GIT_LITERAL_PATHSPECS: a stray file named `archive/*` must not act as a wildcard
     subprocess.run(["git", "reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                   input=b"".join(e[3].encode("utf-8", "surrogateescape") + b"\0" for e in stray), check=True)
+                   input=b"".join(e[3].encode("utf-8", "surrogateescape") + b"\0" for e in stray),
+                   env={**os.environ, "GIT_LITERAL_PATHSPECS": "1"}, check=True)
     for n, e in enumerate(stray, 1):
         log.append(f"skipped (not archive output, left uncommitted): {label(n, e[3])}")
 entries = raw_diff()
-if any(not ALLOWED.fullmatch(e[3]) for e in entries):
+if any(not ALLOWED.fullmatch(e[3]) or (e[2] != "D" and e[0] not in REGULAR) for e in entries):
     log.append("a stray path could not be unstaged")
     problems += 1
 blobs = []
@@ -157,7 +166,7 @@ for n, (mode, oid, status, path) in enumerate(entries, 1):
         problems += 1
     if status == "D":
         continue
-    if mode != "100644" and mode != "100755":
+    if mode not in REGULAR:
         log.append(f"staged entry {label(n, path)} is not a regular file (mode {mode})")
         problems += 1
         continue
@@ -242,6 +251,7 @@ commit_archive() {
     local parent idx tree commit gate problems skipped changes
     parent="$(git rev-parse --verify --quiet HEAD)" || parent=""
     idx="$(mktemp "${TMPDIR:-/tmp}/lucys-tape-index.XXXXXX")" || { bad "cannot create a temporary index"; return 1; }
+    TMP_INDEX="$idx"  # removed by the EXIT trap if we are killed mid-way
     if [ -n "$parent" ]; then GIT_INDEX_FILE="$idx" git read-tree "$parent" 2>>"$LOG"
     else GIT_INDEX_FILE="$idx" git read-tree --empty 2>>"$LOG"; fi \
         && GIT_INDEX_FILE="$idx" git add -A -- archive/ 2>>"$LOG" \
@@ -262,9 +272,11 @@ commit_archive() {
     # (an empty old value means "must not exist yet", for a first commit)
     git update-ref -m "tape: refresh archive" "refs/heads/$BRANCH" "$commit" "$parent" 2>>"$LOG" \
         || { bad "the branch moved during the refresh — nothing committed, run again"; log "archive commit: update-ref refused"; return 1; }
-    # the user's index still lists the old archive blobs; point its archive entries at
-    # the new commit so `git status` stays clean (their other staged work is untouched)
-    git reset -q -- archive/ 2>>"$LOG" || warn "could not refresh the index for archive/ (run: git reset -- archive/)"
+    # the user's index still lists the old blobs of the files just committed; point
+    # those entries (only those) at the new commit so `git status` stays clean
+    git diff-tree -r -z --no-renames --name-only ${parent:+"$parent"} "$commit" 2>>"$LOG" \
+        | GIT_LITERAL_PATHSPECS=1 git reset -q --pathspec-from-file=- --pathspec-file-nul 2>>"$LOG" \
+        || warn "could not refresh the index for the committed files (run: git reset -- archive/)"
     COMMITTED=1; ok "committed ${changes} archive change(s)"
 }
 

@@ -120,16 +120,51 @@ class TapeUpdateTests(unittest.TestCase):
         self.assertNotIn("archive/my-notes.txt", self.remote_files())
         self.assertTrue(any("dddd-4444" in p for p in self.remote_files()))
 
-    def test_a_newline_in_a_file_name_cannot_hide_its_content(self):
+    def test_a_file_name_with_a_newline_is_left_uncommitted(self):
         self.update()
         d = self.repo / "archive" / "conversations" / "-home-u-proj"
-        (d / "evil.md").write_text("clean\n")
-        (d / "evil.md\n").write_text("key sk-proj-" + "D" * 30 + "\n")
-        head = self.git("rev-parse", "HEAD")
+        (d / "note.md\n").write_text("harmless\n")
+        self.add_session("-home-u-proj", "eeee-5555", "more")
         r = self.update()
-        self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertNotIn("D" * 30, self.git("--git-dir", str(self.remote), "log", "-p", "--all", cwd=self.tmp))
-        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("left uncommitted", r.stdout)
+        self.assertFalse(any("\n" in p for p in self.git(
+            "--git-dir", str(self.remote), "ls-tree", "-r", "-z", "--name-only", "main", cwd=self.tmp).split("\0")))
+
+    def test_the_gate_scans_the_committed_bytes(self):
+        # Call the gate directly on a private index holding a key under an allowed name,
+        # so neither the redactor nor the working-tree backstop is involved.
+        self.update()
+        f = self.repo / "archive" / "conversations" / "-home-u-proj" / "x.md"
+        f.write_text("key sk-proj-" + "D" * 30 + "\n")
+        src = (self.repo / "tools" / "tape").read_text()
+        gate = src[src.index("archive_gate() {"):src.index("\nPY\n}\n", src.index("archive_gate() {")) + 6]
+        rx = src.split("LEAK_RX='", 1)[1].split("'\n", 1)[0]
+        script = (f"{gate}\nexport GIT_INDEX_FILE=\"$1\"\ngit read-tree HEAD && git add -A -- archive/ && archive_gate")
+        env = {**self.env, "LEAK_RX": rx, "LOG": str(self.tmp / "gate.log")}
+        r = subprocess.run([BASH, "-c", script, "gate", str(self.tmp / "idx")], cwd=self.repo, env=env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.stdout.split()[0], "1", r.stdout + r.stderr)
+        self.assertIn("staged content of archive/conversations/-home-u-proj/x.md", (self.tmp / "gate.log").read_text())
+
+    def test_a_stray_named_like_a_wildcard_does_not_unstage_the_archive(self):
+        self.update()
+        (self.repo / "archive" / "*").write_text("stray\n")
+        self.add_session("-home-u-proj", "ffff-6666", "wild")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(any("ffff-6666" in p for p in self.remote_files()))
+        self.assertNotIn("archive/*", self.remote_files())
+
+    def test_staged_work_under_archive_is_not_dropped(self):
+        self.update()
+        (self.repo / "archive" / "my-notes.txt").write_text("mine\n")
+        self.git("add", "archive/my-notes.txt")
+        self.add_session("-home-u-proj", "gggg-7777", "again")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("archive/my-notes.txt", self.git("diff", "--cached", "--name-only"))
+        self.assertNotIn("archive/my-notes.txt", self.remote_files())
 
     def test_unstaged_work_outside_the_archive_is_left_alone(self):
         (self.repo / "notes.txt").write_text("untracked scratch\n")

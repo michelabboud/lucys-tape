@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.9 — 2026-09-28 · the archive gate's re-review findings
+
+### Fixed
+
+- A stray file literally named `archive/*` was read as a wildcard when the gate unstaged it,
+  unstaging the whole archive, so every nightly reported "no changes". Stray paths are now
+  literal (`GIT_LITERAL_PATHSPECS=1`).
+- After committing, the update refreshes only the files it committed in the user's index; work
+  the user staged under `archive/` stays staged (0.2.8 reset all of `archive/`).
+- A symlink or gitlink under an allowed name is skipped as a stray, like any other, instead of
+  stopping the nightly.
+- The temporary index is removed even if the update is killed mid-way.
+- An inherited `GIT_DIR`, `GIT_WORK_TREE` or `GIT_INDEX_FILE` can no longer point the update
+  at another repository or index.
+
+### Tests
+
+- The newline-in-a-file-name test now checks what the gate does (the file is left
+  uncommitted) rather than passing on the working-tree backstop, and a new test runs the gate
+  alone on a private index to prove the byte scan itself catches a key.
+
+### Known limits
+
+- User hooks still run where git runs them for any client: `reference-transaction` on the
+  branch update and `pre-push` on push. Neither can change the committed tree.
+- The archive commit is made with `commit-tree`, which does not sign: a remote that requires
+  signed commits will reject the push.
+
 ## v0.2.8 — 2026-09-28 · the archive commit is built on a private index
 
 The deep review of 0.2.7 showed that `git commit` still committed whatever the index held
