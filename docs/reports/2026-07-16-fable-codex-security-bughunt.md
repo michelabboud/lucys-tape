@@ -5,6 +5,32 @@
 - **Reviewed commit:** `d4b739433dd564c3755f0b8ea5cd96ff47df1c18` (`main`)
 - **Method:** static source review only
 
+## Resolution (added 2026-09-28)
+
+*The findings below are the July text, unchanged. This table records where each was fixed,
+released in v0.3.0. Each fix has a regression test that fails on the code before it, and
+each change had a deep review at task grain. The release gate had two blind reviews
+(Claude Fable 5.1 and gpt-5.6-sol); their fixes are 0.2.23–0.2.25 (`fc2b6c0`, `9067f46`, `e17f32d`), each followed by a confirm pass.
+The limits accepted at the gate are in `SECURITY.md`.*
+
+| ID | Fixed in | Commits | What changed, in one line |
+|---|---|---|---|
+| LT-SEC-001 | 0.2.12–0.2.13, 0.2.23 | `b00c4ac`, `4673abe`, `fc2b6c0` | The DB is built from the final masked Markdown into a side file; backups and releases follow it. |
+| LT-SEC-002 | 0.2.4–0.2.6 | `db95870`, `9868f75`, `d7cfbd7` | Headless and DER key bodies, quoted and cloud-style assignments, padded base64, namespaced `sk-` keys; the guard stays a subset. |
+| LT-SEC-003 | 0.2.7–0.2.9 | `a29784b`, `811efdb`, `7d35d1f` | The archive commit is built on a private index from `archive/` only; the exact staged blobs are scanned. |
+| LT-SEC-004 | 0.2.10–0.2.11, 0.2.24–0.2.25 | `7235e3d`, `84762ce`, `9067f46`, `e17f32d` | One trusted destination recorded at init; every push and release checks it; `gh` is bound to that repo. A GitHub push goes only when GitHub confirms PRIVATE (or you accepted otherwise for that destination with `tape trust --without-gh`). |
+| LT-SEC-005 | 0.2.14–0.2.15, 0.2.25 | `606431b`, `b660af8`, `e17f32d` | Titles, metadata and file names pass the redactor; a name that would change becomes a hash, and names written by older versions are renamed the same way. |
+| LT-SEC-006 | 0.2.17–0.2.18 | `653b5f1`, `1a2141b` | `umask 077` in every tool; existing files and kept backups made private. |
+| LT-SEC-007 | 0.2.19–0.2.20 | `8c685e8`, `bb830cf` | Host check, per-launch key exchanged for an `HttpOnly`, `SameSite=Strict` session cookie. The cookie still reaches other 127.0.0.1 ports (SECURITY.md, next task). |
+| LT-SEC-008 | 0.2.19–0.2.20 | `8c685e8`, `bb830cf` | Every metadata sink escaped, ids URL-encoded, a strict metadata schema in the builder, CSP kept. |
+| LT-SEC-009 | 0.2.21–0.2.23 | `c2907fc`, `48dd3f7`, `fc2b6c0` | Sources read only inside their folders, checked on the opened file; archive written by descriptor walk, private temp file and rename. |
+| LT-SEC-010 | 0.2.19–0.2.23 | `8c685e8`, `bb830cf`, `48dd3f7`, `fc2b6c0` | Search length, 16 concurrent connections, a whole-connection deadline (5 s before the cookie); linear redactor on digit runs. Paging of huge conversations is open (BACKLOG). |
+| LT-SEC-011 | 0.2.17–0.2.18 | `653b5f1`, `1a2141b` | A private per-user lock whose owner is PID plus start time; stale locks reclaimed once. |
+| LT-SEC-012 | 0.2.17 | `653b5f1` | Backup rotation in Python over owned regular files; no file name reaches an argument list. |
+| LT-SEC-013 | 0.2.10, 0.2.23 | `7235e3d`, `fc2b6c0` | Printed remote URLs have their credentials masked and their control characters removed. |
+| LT-SEC-014 | 0.2.14–0.2.16 | `606431b`, `b660af8`, `2efaee6` | Structure-looking body lines are escaped; the builder splits on `\n` only and accepts only known roles and kinds. |
+| LT-SEC-015 | 0.2.12 | `b00c4ac` | Rebuilds go to a temporary file and replace the DB atomically. |
+
 ## Scope and constraints
 
 The review covered the Python extractor, Markdown-to-SQLite builder, note

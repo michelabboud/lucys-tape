@@ -1,6 +1,12 @@
 # Progress
 
 ## Done
+- v0.3.0 (2026-09-29) — Phase 1, safe to use: all 15 findings of the July security audit
+  fixed in code (0.2.3–0.2.25), redactor level with its private sibling, the viewer behind a
+  per-launch key, archive writes that never follow a link. 101 → 265 tests, every fix red
+  first. Release gate: two blind reviews (Fable 5.1, gpt-5.6-sol), confirmed after three rounds
+  of fixes (0.2.23–0.2.25). v0.2.3–v0.2.22 are per-task checkpoints (`checkpoint/0.2.x`); the history
+  between v0.2.0 and them is caught up in Phase 3.
 - v0.2.0 — viewer rebuilt: search that cannot crash, result snippets, pagination,
   light/dark themes, keyboard nav, responsive, CSP-hardened. Four pre-existing
   defects fixed, two more found only by opening a browser. 0 → 83 tests. ADR 0004.

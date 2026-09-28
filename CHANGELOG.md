@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.0 — 2026-09-29 · safe to use
+
+The first phase of the 2026-09-28 plan: every finding of the July security audit
+(`docs/reports/2026-07-16-fable-codex-security-bughunt.md`, 4 High, 10 Medium, 1 Low) is fixed
+in code, each with a regression test that fails on the code before it. The entries 0.2.3 to
+0.2.25 below are the per-task steps; this is what they add up to.
+
+- **Secrets:** the redactor catches headless and DER private keys and the audit's blind spots;
+  the leak guard stays a strict subset; the database, backups and release snapshots are built
+  only from the masked Markdown; backups hold no database and no logs.
+- **Where your archive goes:** only `archive/` output is committed, and the exact staged bytes
+  are scanned first; pushes and releases go to the one destination you trusted, and a GitHub
+  push needs GitHub to confirm the repo is PRIVATE.
+- **The viewer:** answers only its own address and only a browser holding this launch's
+  session; every value escaped; inputs and connections bounded.
+- **Files:** private permissions; a private lock; sources read only inside their folders;
+  archive writes that never follow a link; names that carry a secret shape renamed.
+- Tests: 101 → 265.
+
+Release gate: two blind reviews (Claude Fable 5.1: pass; gpt-5.6-sol: blocked), then three
+rounds of fixes (0.2.23–0.2.25), each confirmed. Accepted limits are in `SECURITY.md`; the
+first is the next task.
+
 ## v0.2.25 — 2026-09-29 · rename, never delete; every spelling of GitHub checked
 
 Fixes from the second confirm pass (gpt-5.6-sol, on 0.2.24).

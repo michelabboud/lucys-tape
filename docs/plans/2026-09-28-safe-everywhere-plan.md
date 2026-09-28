@@ -1,6 +1,7 @@
 # Plan: safe to use, runs everywhere (2026-09-28)
 
-**Status:** approved 2026-09-28 (Michel: "go ahead an fix the repo"). Running.
+**Status:** approved 2026-09-28 (Michel: "go ahead an fix the repo"). Running. Phase 1 released as
+v0.3.0 on 2026-09-29 (gate: Fable 5.1 pass, gpt-5.6-sol blocked; fixed in 0.2.23–0.2.25, confirmed).
 **Written by:** Claude Opus 5.5, coordinating. Per the house rules, planning belongs to the top model:
 Claude Fable 5.1 reviews this plan and the Phase 1 code before the Phase 1 release.
 **Tasks run back to back:** when a task closes, the next one starts in the same session.
@@ -53,12 +54,13 @@ Lucy's Tape is public, and people install it to keep their own conversations pri
 | 1.7 | The viewer: Host-header validation and a per-run access token on loopback, escaping on every metadata sink, bounded inputs and concurrency. | 007, 008, 010 | `tools/conversations_viewer.py` | 1.6 |
 | 1.8 | Path containment: sources resolved inside their roots, symlinks refused or contained. | 009 | extractor, importers | 1.7 |
 | 1.9 | Phase close: high deep review (gate), security notes in CHANGELOG, the bughunt report annotated with each finding's fix commit, `v0.3.0` + GitHub release. | all | docs | 1.8 |
+| 1.10 | Bug-fix lane from the gate (added 2026-09-29): replace the viewer's session cookie, which browsers send to every 127.0.0.1 port, with a per-request capability other ports never receive. Deep review; released as `v0.3.1`. | 007 | `tools/conversations_viewer.py`, `tools/tape` | 1.9 |
 
 ## Phase 2 — runs everywhere → release v0.4.0
 
 | # | Task | Files | Depends on |
 |---|---|---|---|
-| 2.1 | CI on GitHub Actions: tests + ruff on Ubuntu, macOS and Windows; `bash -n` + shellcheck on the CLI. Runs on push and pull request, publishes nothing. | `.github/workflows/ci.yml` | 1.9 |
+| 2.1 | CI on GitHub Actions: tests + ruff on Ubuntu, macOS and Windows; `bash -n` + shellcheck on the CLI. Runs on push and pull request, publishes nothing. | `.github/workflows/ci.yml` | 1.10 |
 | 2.2 | Python tools audited for Windows: paths, owner-only permissions (ACLs where POSIX modes don't apply), locks. | `tools/*.py` | 2.1 |
 | 2.3 | macOS: `tools/tape` runs under the system bash 3.2 and BSD userland; launchd path tested in CI where possible. | `tools/tape` | 2.1 |
 | 2.4 | Native Windows `tools/tape.ps1`: the same commands and the same guardrails as 1.2–1.6 (staged-blob scan, trusted destination, private files), scheduled through Task Scheduler. | `tools/tape.ps1`, `docs/guides/windows.md` | 2.2 |
