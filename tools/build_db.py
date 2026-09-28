@@ -23,7 +23,8 @@ CONV_DIR = ARCHIVE / "conversations"
 DB_PATH = Path(sys.argv[2]) if len(sys.argv) > 2 else ARCHIVE / "conversations.db"
 
 FAB = re.compile(r"^<!--fab (\{.*\})-->\s*$")
-TURN = re.compile(r"^<!--t role=(\S+) kind=(\S+) model=(\S*) ts=(\S*)-->\s*$")
+TURN = re.compile(r"^<!--t role=(user|assistant|tool) kind=(dialogue|step|note) model=(\S*) ts=(\S*)-->\s*$")
+BODY_ESC = "<!--esc-->"  # see escape_body() in extract_conversations.py
 
 
 def parse_md(path):
@@ -39,6 +40,8 @@ def parse_md(path):
         lines = body.split("\n")
         if lines and lines[0].lstrip().startswith("### "):
             lines = lines[1:]
+        # undo the extractor's escape of structure-looking body lines (LT-SEC-014)
+        lines = [ln[len(BODY_ESC):] if ln.startswith(BODY_ESC) else ln for ln in lines]
         turns.append((*cur, "\n".join(lines).strip()))
 
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():

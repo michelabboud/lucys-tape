@@ -35,6 +35,7 @@ _spec = importlib.util.spec_from_file_location(
 _ec = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ec)
 redact, slugify, _red = _ec.redact, _ec.slugify, _ec._red
+meta_text, path_component, escape_body = _ec.meta_text, _ec.path_component, _ec.escape_body
 
 _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 GLOB = "*.txt"
@@ -93,8 +94,8 @@ def drop_contained(candidates):
 
 def write_note(path, text):
     ts = mtime_iso(path)
-    sid = f"note-{slugify(path.stem)}"
-    title = redact(derive_title(text, path.stem))
+    sid = f"note-{path_component(slugify(path.stem))}"
+    title = meta_text(derive_title(text, path.stem))
     fab = {"sid": sid, "started": ts, "ended": ts, "models": "", "branch": "",
            "n_dialogue": 1, "user_turns": 1, "assistant_turns": 0, "n_steps": 0,
            "project": PROJECT}
@@ -103,10 +104,10 @@ def write_note(path, text):
         f.write(f"<!--fab {json.dumps(fab, separators=(',', ':'))}-->\n\n")
         f.write(f"# {title}\n\n| | |\n|---|---|\n")
         f.write(f"| **Project** | {PROJECT} |\n| **Saved** | {ts} |\n")
-        f.write(f"| **Source** | hand-saved capture `{path.name}` (pre-archive era) |\n")
+        f.write(f"| **Source** | hand-saved capture `{meta_text(path.name, 120)}` (pre-archive era) |\n")
         f.write(f"| **Session** | `{sid}` |\n\n---\n")
         f.write(f"\n<!--t role=user kind=note model=- ts={ts}-->\n")
-        f.write(f"### 📜 Note · {ts[:19].replace('T', ' ')}\n\n{text}\n")
+        f.write(f"### 📜 Note · {ts[:19].replace('T', ' ')}\n\n{escape_body(text)}\n")
     return out
 
 
@@ -120,14 +121,14 @@ def main():
 
     with open(OUT_DIR / "README.md", "w", encoding="utf-8") as f:
         f.write("# 📜 notes-prehistory — the manual archive era\n\n"
-                f"Hand-saved conversation captures imported from `{NOTES}` (`{GLOB}`) — "
+                f"Hand-saved conversation captures imported from a notes folder (`{meta_text(GLOB, 80)}`) — "
                 "the conversations saved by hand before the tape existed. Dates are file "
                 "mtimes; titles are derived first lines; every byte passed the redactor "
                 "on import.\n\n"
                 f"**{len(written)} imported** · {len(skipped)} skipped (jottings/scraps) · "
                 f"{len(contained)} skipped (re-saves contained in larger captures)\n\n"
                 "Skipped, for the record:\n\n"
-                + "".join(f"- `{n}` — {why}\n" for n, why in sorted(skipped + contained)))
+                + "".join(f"- `{meta_text(n, 120)}` — {meta_text(why, 200)}\n" for n, why in sorted(skipped + contained)))
 
     print(f"imported          : {len(written)}")
     print(f"skipped jottings  : {len(skipped)}")

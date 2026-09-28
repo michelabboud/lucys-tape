@@ -17,6 +17,7 @@ only ever stores diffable text and never a binary blob.
   <out>/INDEX.md
   <out>/REDACTION-REPORT.txt
 """
+import hashlib
 import json
 import re
 import sys
@@ -276,6 +277,54 @@ SYSREMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 LOCALCMD = re.compile(r"<(command-name|command-message|command-args|command-stdout|local-command-[a-z]+)>.*?</\1>", re.S)
 
 
+# ---- metadata and names (LT-SEC-005, LT-SEC-014) ------------------------------
+# Every stored string passes the redactor: dialogue and labels above, and the
+# metadata here (session id, project, branch, model, timestamps, source names).
+# A NAME on disk is stricter still: if redaction would change it, the name is
+# replaced by a stable hash, so a secret can never become a path.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+_UNSAFE_IN_NAME = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]+')
+
+
+def meta_text(value, cap=2000):
+    """A metadata value for display: redacted, one line, bounded."""
+    return _CONTROL.sub(" ", redact(str(value or ""))).strip()[:cap]
+
+
+def sentinel_value(value):
+    """A value inside a turn sentinel: redacted, one token, and unable to close the
+    comment early. Only whitespace and `-->` are changed, so real values keep their
+    exact spelling (`<synthetic>` stays `<synthetic>`)."""
+    v = re.sub(r"\s+", "_", meta_text(value, 200))
+    while "-->" in v:
+        v = v.replace("-->", "--_")
+    return v
+
+
+def path_component(value, fallback="unknown"):
+    """A folder or file name part: never carries a secret, safe on every OS.
+
+    Names that need no redaction keep their exact spelling (existing archives keep
+    their paths); only characters no filesystem accepts are replaced.
+    """
+    raw = str(value or "")
+    if redact(raw) != raw:
+        return "redacted-" + hashlib.sha256(raw.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    name = _UNSAFE_IN_NAME.sub("-", raw).strip(" .")[:120]
+    return name if name and name not in (".", "..") else fallback
+
+
+# A body line that looks like the archive's own structure (a turn sentinel, the
+# metadata line, or an already-escaped line) is prefixed with ESC on write and
+# unescaped by build_db, so conversation text cannot forge turns or metadata.
+BODY_ESC = "<!--esc-->"
+_STRUCTURAL = re.compile(r"^\s*<!--(?:t |fab |esc-->)")
+
+
+def escape_body(text):
+    return "\n".join(BODY_ESC + ln if _STRUCTURAL.match(ln) else ln for ln in text.split("\n"))
+
+
 def short_path(p):
     p = str(p)
     for marker in ("/projects/", "/.claude/"):
@@ -365,9 +414,9 @@ def parse_session(path):
     if not any(k == "dialogue" for _, k, _, _, _ in turns):
         return None
     return {
-        "sid": path.stem, "title": redact(title or "untitled conversation"),
-        "project": None, "started": started or "", "ended": ended or "",
-        "models": ", ".join(sorted(models)), "branch": ", ".join(sorted(branches)),
+        "sid": path.stem, "title": meta_text(title or "untitled conversation"),
+        "project": None, "started": meta_text(started), "ended": meta_text(ended),
+        "models": meta_text(", ".join(sorted(models))), "branch": meta_text(", ".join(sorted(branches))),
         "n_dialogue": u + a, "user_turns": u, "assistant_turns": a, "n_steps": steps,
         "turns": turns, "chars": sum(len(x[4]) for x in turns),
     }
@@ -688,10 +737,10 @@ def parse_codex_session(path):
     user_msgs = [tx for (r, k, _ts, _m, tx) in turns if r == "user" and k == "dialogue"]
     return {
         "sid": sid, "engine": "codex",
-        "title": redact(codex_title(user_msgs) or "codex session"),
+        "title": meta_text(codex_title(user_msgs) or "codex session"),
         "project": codex_project_label(cwd),
-        "started": started or "", "ended": ended or "",
-        "models": ", ".join(sorted(models)), "branch": ", ".join(sorted(branches)),
+        "started": meta_text(started), "ended": meta_text(ended),
+        "models": meta_text(", ".join(sorted(models))), "branch": meta_text(", ".join(sorted(branches))),
         "n_dialogue": u + a, "user_turns": u, "assistant_turns": a, "n_steps": steps,
         "turns": turns, "chars": sum(len(x[4]) for x in turns),
     }
@@ -711,6 +760,10 @@ def write_markdown(meta, project, path):
         out.write(f"| **Dialogue** | {meta['n_dialogue']} ({meta['user_turns']} you / {meta['assistant_turns']} assistant) |\n")
         out.write(f"| **Tool steps** | {meta['n_steps']} |\n| **Session** | `{meta['sid']}` |\n\n---\n")
         for role, kind, ts, model, text in meta["turns"]:
+            # sentinel fields are single tokens: redacted, no spaces or markup
+            model = sentinel_value(model)
+            ts = sentinel_value(ts)
+            text = escape_body(text)
             out.write(f"\n<!--t role={role} kind={kind} model={model or '-'} ts={ts or '-'}-->\n")
             if kind == "step":
                 who = "🔧 step"
@@ -731,13 +784,13 @@ def main():
         files = list(proj_dir.rglob("*.jsonl"))
         if not files:
             continue
-        label = project_label(proj_dir.name)
+        label = path_component(project_label(proj_dir.name))
         for f in files:
             scanned += 1
             meta = safe_parse(parse_session, f)
             if not meta:
                 continue
-            sid = meta["sid"]
+            meta["sid"] = sid = path_component(meta["sid"])
             if sid in seen and meta["chars"] <= seen[sid]:
                 continue
             seen[sid] = meta["chars"]
@@ -755,11 +808,11 @@ def main():
             meta = safe_parse(parse_codex_session, f)
             if not meta:
                 continue
-            sid = meta["sid"]
+            meta["sid"] = sid = path_component(meta["sid"])
             if sid in seen and meta["chars"] <= seen[sid]:
                 continue
             seen[sid] = meta["chars"]
-            label = meta["project"]
+            label = path_component(meta["project"], "codex-misc")
             proj_out = CONV_DIR / label
             proj_out.mkdir(parents=True, exist_ok=True)
             date = (meta["started"] or "0000-00-00")[:10]

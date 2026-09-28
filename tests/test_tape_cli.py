@@ -97,19 +97,6 @@ class TapeUpdateTests(TapeRepoCase):
         con.close()
         return repr(rows)
 
-    def test_the_db_is_built_from_the_masked_markdown(self):
-        # A secret in a field the redactor does not see (the git branch, LT-SEC-005)
-        # is masked in the Markdown by the guard; the DB must hold the masked text too.
-        d = self.home / ".claude" / "projects" / "-home-u-proj"
-        recs = [{"type": "user", "sessionId": "hhhh-8888", "timestamp": "2026-09-01T10:00:00Z", "cwd": "/home/u/proj",
-                 "gitBranch": "sk-proj-" + "B" * 30, "message": {"role": "user", "content": "hi"}},
-                {"type": "assistant", "sessionId": "hhhh-8888", "timestamp": "2026-09-01T10:00:05Z",
-                 "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": "ok"}]}}]
-        (d / "hhhh-8888.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
-        r = self.update()
-        self.assertIn("guard masked", r.stdout)
-        self.assertNotIn("B" * 30, self.db_text())
-
     def test_a_suspicious_rebuild_keeps_the_last_good_db(self):
         for i in range(12):
             self.add_session("-home-u-proj", f"keep-{i:04d}", f"conversation {i}")
@@ -151,15 +138,6 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertNotIn("TAILTAIL", md)
         self.assertNotIn("TAILTAIL", self.db_text())
 
-    def test_weekly_backup_and_release_skip_a_failed_refresh(self):
-        backups = self.tmp / "backups"
-        self.env.update(TAPE_FORCE_DB_DAILY="1", TAPE_BACKUP_DIR=str(backups))
-        self.add_session("-home-u-sk-proj-" + "C" * 30, "cccc-3333", "hi")  # the gate refuses this commit
-        r = self.update()
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("skipped the weekly backup", r.stdout)
-        self.assertFalse(backups.exists() and any(backups.iterdir()))
-
     def test_leftovers_of_an_interrupted_build_are_cleaned(self):
         self.update()
         a = self.repo / "archive"
@@ -170,6 +148,65 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(sorted(p.name for p in a.glob("conversations.db*")), ["conversations.db"])
         self.assertNotIn("left uncommitted", r.stdout)
+
+    def remote_blob_text(self):
+        return self.git("--git-dir", str(self.remote), "log", "-p", "--all", "--format=%H", cwd=self.tmp)
+
+    def test_secret_in_a_project_name_never_reaches_a_path_or_file(self):
+        # LT-SEC-005: a project folder named after a key used to reach INDEX.md and the
+        # file path verbatim. The folder is now named by a hash and nothing leaks.
+        self.add_session("-home-u-sk-proj-" + "C" * 30, "cccc-3333", "hi")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        files = self.remote_files()
+        self.assertTrue(any(p.startswith("archive/conversations/redacted-") for p in files), files)
+        self.assertFalse(any("C" * 20 in p for p in files))
+        self.assertNotIn("C" * 20, self.remote_blob_text())
+        self.assertNotIn("C" * 20, self.db_text())
+
+    def test_metadata_fields_pass_the_redactor(self):
+        d = self.home / ".claude" / "projects" / "-home-u-proj"
+        recs = [{"type": "user", "sessionId": "hhhh-8888", "timestamp": "2026-09-01T10:00:00Z", "cwd": "/home/u/proj",
+                 "gitBranch": "sk-proj-" + "B" * 30, "message": {"role": "user", "content": "hi"}},
+                {"type": "assistant", "sessionId": "hhhh-8888", "timestamp": "2026-09-01T10:00:05Z",
+                 "message": {"role": "assistant", "model": "sk-proj-" + "M" * 30,
+                             "content": [{"type": "text", "text": "ok"}]}}]
+        (d / "hhhh-8888.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("output already clean", r.stdout)  # the redactor got it, not the guard
+        for secret in ("B" * 20, "M" * 20):
+            self.assertNotIn(secret, self.remote_blob_text())
+            self.assertNotIn(secret, self.db_text())
+
+    def test_a_session_id_carrying_a_key_is_not_a_file_name(self):
+        self.add_session("-home-u-proj", "sk-proj-" + "S" * 30, "hi")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(any("S" * 20 in p for p in self.remote_files()))
+        self.assertNotIn("S" * 20, self.remote_blob_text())
+
+    def test_the_db_is_built_from_the_masked_markdown(self):
+        # A Markdown file with no source (an imported note, a hand edit) is never
+        # re-extracted, so only the guard's masker can clean it; the DB must be built
+        # from the masked text (LT-SEC-001).
+        self.update()
+        d = self.repo / "archive" / "conversations" / "-home-u-proj"
+        (d / "2026-09-01__hand__hand-1.md").write_text(
+            '<!--fab {"sid":"hand-1","project":"-home-u-proj","started":"2026-09-01T00:00:00Z"}-->\n\n# hand\n'
+            "\n<!--t role=user kind=note model=- ts=-->\n### note\n\nkey sk-proj-" + "B" * 30 + "\n")
+        r = self.update()
+        self.assertIn("guard masked", r.stdout)
+        self.assertNotIn("B" * 20, self.db_text())
+
+    def test_weekly_backup_and_release_skip_a_failed_refresh(self):
+        backups = self.tmp / "backups"
+        self.env.update(TAPE_FORCE_DB_DAILY="1", TAPE_BACKUP_DIR=str(backups))
+        self.git("config", "--local", "--unset", "tape.destination")  # the push is refused
+        r = self.update()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("skipped the weekly backup", r.stdout)
+        self.assertFalse(backups.exists() and any(backups.iterdir()))
 
     def test_low_disk_refusal_stops_the_update(self):
         self.env["TAPE_MIN_FREE_GB"] = "999999999"
@@ -263,20 +300,6 @@ class TapeUpdateTests(TapeRepoCase):
         status = self.git("status", "--porcelain")
         self.assertIn("?? notes.txt", status)
         self.assertIn(" M tools/tape", status)
-
-    def test_secret_in_a_project_name_is_never_committed(self):
-        # A project folder named after a key reaches INDEX.md and the file path, which
-        # the Markdown masker does not cover (LT-SEC-005). The staged-content check must
-        # refuse the whole commit rather than push it.
-        self.add_session("-home-u-sk-proj-" + "C" * 30, "cccc-3333", "hi")
-        head = self.git("rev-parse", "HEAD")
-        r = self.update()
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("nothing committed", r.stdout)
-        self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertEqual(self.git("diff", "--cached", "--name-only"), "")
-        log = (self.repo / "archive" / "refresh.log").read_text()
-        self.assertNotIn("C" * 30, log)
 
 
 def tape_library(repo):

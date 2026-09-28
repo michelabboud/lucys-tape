@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.14 — 2026-09-28 · metadata and names pass the redactor; text cannot forge structure
+
+### Security
+
+- **LT-SEC-005: metadata and file names bypassed the redactor.** A session's git branch and
+  model name were written verbatim (the model name into `INDEX.md` too), and a project folder
+  or session id became a folder and file name as-is, so a key in any of them was committed
+  and pushed. Now every metadata value (session id, project, branch, model, timestamps,
+  titles, the notes importer's source names and skip reasons) passes the redactor, on one line
+  and bounded. A folder or file name that redaction would change is replaced by a stable hash
+  (`redacted-<hash>`), so a secret can never become a path; any other name keeps its exact
+  spelling, and only characters no filesystem accepts are replaced. The notes importer no
+  longer writes the absolute path of your notes folder.
+- **LT-SEC-014: conversation text could forge turns.** A line in a message that looked like the
+  archive's turn marker (`<!--t role=… -->`) was read back by the database builder as a new
+  turn, able to change who said what. Such lines, and lines that look like the metadata or
+  the escape itself, are now escaped when written (`<!--esc-->` prefix) and unescaped when the
+  database is built; turn markers only accept known roles and kinds, and a model or timestamp
+  value cannot close the marker early. Existing archives rebuild unchanged.
+
+### Measured
+
+Old and new extractors run over the same real sources (5,564 files): identical file paths, and
+identical content except for sessions still being written during the comparison.
+
 ## v0.2.13 — 2026-09-28 · the DB-order review findings
 
 ### Security
