@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2.4 — 2026-09-28 · the redactor closes its known blind spots
+
+### Security
+
+- **Headless private keys are redacted.** A key body followed by its `END` footer with no
+  `BEGIN` header (what `cut -d= -f1` prints for a multi-line value in an env file) used to
+  lose only its footer, which was defanged, so the leak guard passed while the whole body
+  survived. Now caught three ways: body + footer, a header + body joined by spaces, and a bare
+  body recognised by its DER prefix (PKCS#1, PKCS#8, EC, OpenSSH). Public keys, certificates
+  and CSRs are left alone. Ported from the private archive this project was extracted from,
+  where it was found on 2026-09-03. The leak guard learned the same DER prefixes.
+- **LT-SEC-002, credential shapes the July bughunt found** (all were live before this release;
+  35 new test cases failed first):
+  - `{"password": "…"}` and other quoted keys: a quote between the name and the colon hid the value.
+  - `db_password=`, `my_api_key =`, `AWS_SECRET_ACCESS_KEY=`: a name that follows an underscore.
+  - `sk-proj-…`, `sk-svcacct-…`, `sk-or-v1-…`, `sk_live_…`, `rk_live_…`: namespaced keys. The
+    leak guard learned namespaced `sk-` keys too, as a strict subset of the redactor.
+  - Padded base64 keys followed by a space, a quote or the end of the text (`=\b` never matched
+    there), or starting with `+` or `/`.
+  - Private keys wrapped narrower than 40 columns.
+  - Azure `AccountKey=` / `SharedAccessKey=` in connection strings.
+- Redacted assignments keep their separator and quotes, so `{"password": "[REDACTED]"}` stays
+  valid JSON.
+
+### Measured
+
+On a 1,500-file sample of a real archive: the new redactor hides **nothing less** than the old
+one (0 tokens visible that were hidden before). 32 files come out different, all from the wider
+name rules; in code, a declaration such as `access_token: Option<String>` now has its type
+masked. That over-redaction is deliberate: exempting code-looking values would let through a
+password that happens to contain a bracket. CSP / Subresource Integrity hashes (`'sha256-…='`)
+were the only new base64 hits in a first sample and are excluded as public digests.
+
 ## v0.2.3 — 2026-09-28 · repo paperwork and the safe-everywhere plan
 
 ### Added

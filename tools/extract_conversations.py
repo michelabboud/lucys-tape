@@ -38,8 +38,25 @@ CONV_DIR = OUT / "conversations"
 REDACTIONS = [
     ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S), "[REDACTED PRIVATE KEY BLOCK]"),
     # Truncated paste: header + base64 body but no END footer. Must be eaten as a
-    # real secret — only after this can a surviving header be presumed bare.
-    ("private_key_truncated", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:[ \t]*\r?\n[ \t]*[A-Za-z0-9+/=]{40,})+"), "[REDACTED PRIVATE KEY BLOCK]"),
+    # real secret — only after this can a surviving header be presumed bare. Body
+    # lines as short as 16 chars count (LT-SEC-002): a key wrapped narrower than the
+    # usual 64 columns must not leave its body behind a defanged header. The same
+    # floor applies to the headless rule below.
+    ("private_key_truncated", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\s+[A-Za-z0-9+/=]{16,})+"), "[REDACTED PRIVATE KEY BLOCK]"),
+    # Headless paste: a key BODY followed by its END footer with no BEGIN header,
+    # which is what `cut -d= -f1` over an env file yields for a multi-line value (the
+    # continuation lines carry no `=`). Without this rule, pem_footer_bare defanged the
+    # footer, so the guard passed, and every base64 body token survived. Body + footer
+    # is a real secret: eaten whole, and BEFORE the bare-footer rule.
+    ("private_key_headless", re.compile(r"(?:[A-Za-z0-9+/=]{16,}\s+){2,}-----END [A-Z0-9 ]*PRIVATE KEY-----"), "[REDACTED PRIVATE KEY BLOCK]"),
+    # A private-key body with NO PEM framing at all, recognised by its DER prefix in
+    # base64: PKCS#1 RSA (MII..IBAAKCAQ / IBAAKCAgEA for 4096-bit), PKCS#8
+    # (MII..IBADANBgkqhkiG9w0BAQEFAASC; AASC is the OCTET STRING only a private key
+    # carries, while public keys read AAOCAQ8 and certificates TCCA, so those survive),
+    # SEC1 EC (MHQCAQEEI / MIGHAgEAMBMGByqGSM49) and OpenSSH (b3BlbnNzaC1rZXktdjE).
+    # The length prefix after MII is THREE base64 chars. Whitespace-separated
+    # continuation is eaten too.
+    ("private_key_der_body", re.compile(r"\b(?:MII[A-Za-z0-9+/]{3}(?:IBAAKCAQ|IBAAKCAgEA|IBADANBgkqhkiG9w0BAQEFAASC)|MHQCAQEEI|MIGHAgEAMBMGByqGSM49|b3BlbnNzaC1rZXktdjE)[A-Za-z0-9+/=]*(?:\s+[A-Za-z0-9+/=]{40,})*"), "[REDACTED PRIVATE KEY BODY]"),
     # Bare header/footer in prose or code (a *mention*, no key material): defang so
     # the stored text can never trip the pre-commit leak guard, but stays readable.
     ("pem_header_bare", re.compile(r"-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----"), r"-----BEGIN (defanged) \1PRIVATE KEY-----"),
@@ -52,6 +69,13 @@ REDACTIONS = [
     # the anchor keeps the redactor a superset of the guard. The leading \b stays
     # (a key starts at a word boundary).
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}"), "[REDACTED sk-key]"),
+    # Namespaced keys (LT-SEC-002): sk-proj-, sk-svcacct-, sk-admin-, sk-or-v1-, …
+    # The plain rule above stops at the namespace's hyphen, so these slipped past
+    # both it and the guard. The guard now carries a narrower copy (lowercase
+    # namespace, hyphen only) so it stays a strict subset of this rule.
+    ("openai_ns_key", re.compile(r"\bsk-[A-Za-z0-9]{2,12}[-_][A-Za-z0-9_\-]{20,}"), "[REDACTED sk-key]"),
+    # Stripe-style secret and restricted keys: sk_live_, sk_test_, rk_live_, rk_test_.
+    ("stripe_key", re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}"), "[REDACTED stripe-key]"),
     ("xai_key", re.compile(r"\bxai-[A-Za-z0-9]{20,}"), "[REDACTED xai-key]"),
     ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b"), "[REDACTED github-token]"),
     ("github_fine_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b"), "[REDACTED github-pat]"),
@@ -80,10 +104,28 @@ REDACTIONS = [
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"), "[REDACTED jwt]"),
     ("bearer", re.compile(r"(?i)\b(bearer|authorization:?\s*bearer)\s+[A-Za-z0-9._\-]{20,}"), "[REDACTED bearer-token]"),
     ("conn_string_pw", re.compile(r"\b((?:postgres|postgresql|mysql|mongodb|redis|amqp)://[^:/\s]+:)[^@/\s]+(@)"), r"\1[REDACTED-PW]\2"),
-    ("b64_32", re.compile(r"\b[A-Za-z0-9+/]{42,43}=\b"), "[REDACTED base64-key]"),
-    ("b64_64", re.compile(r"\b[A-Za-z0-9+/]{85,87}=\b"), "[REDACTED base64-key]"),
-    ("assignment", re.compile(r"""(?ix)\b(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b\s*[:=]\s*["']?([^\s"',;]{6,})"""), r"\1=[REDACTED]"),
-    ("env_named", re.compile(r"\b([A-Z0-9_]*_(?:API_KEY|SECRET|TOKEN|PASSWORD|ENC_KEY|PRIVATE_KEY))\s*=\s*\S+"), r"\1=[REDACTED]"),
+    # Azure storage / Service Bus connection strings carry the key as AccountKey= or
+    # SharedAccessKey=; the account name and endpoint around it stay readable.
+    ("azure_conn_key", re.compile(r"(?i)\b(AccountKey|SharedAccessKey)=[^;\s\"']+"), r"\1=[REDACTED]"),
+    # Padded base64 for 32- and 64-byte keys. Delimited by lookarounds, not \b
+    # (LT-SEC-002): `=` is not a word character, so the old `=\b` could only match
+    # when the padding was followed by a letter, never by a space, quote or the end
+    # of the text; and a leading \b missed keys that start with `+` or `/`.
+    # CSP / Subresource Integrity hashes ('sha256-…=') are public digests, not
+    # secrets: measured on a 400-file sample, they were every new hit, so they are
+    # excluded by their prefix.
+    ("b64_32", re.compile(r"(?<![A-Za-z0-9+/])(?<!sha256-)(?<!sha384-)(?<!sha512-)[A-Za-z0-9+/]{42,43}={1,2}(?![A-Za-z0-9+/=])"), "[REDACTED base64-key]"),
+    ("b64_64", re.compile(r"(?<![A-Za-z0-9+/])(?<!sha256-)(?<!sha384-)(?<!sha512-)[A-Za-z0-9+/]{85,87}={1,2}(?![A-Za-z0-9+/=])"), "[REDACTED base64-key]"),
+    # NAME = value / NAME: value / "NAME": "value". LT-SEC-002 widened three things:
+    # the name may follow an underscore (db_password, AWS_SECRET_ACCESS_KEY, where a
+    # leading \b never matched), a closing quote may sit between name and separator
+    # (JSON and Python dict keys), and the separator and quotes are kept, so
+    # {"password": "x"} becomes {"password": "[REDACTED]"} and stays valid JSON.
+    ("assignment", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*["']?)(?!\[REDACTED\])([^\s"',;]{6,})"""), r"\1\2[REDACTED]"),
+    # Upper-case env names ending in a secret-ish suffix. Unquoted values are taken to
+    # the next whitespace; quoted ones whole. An already-redacted value is left alone,
+    # so this rule never undoes the separator the rule above kept.
+    ("env_named", re.compile(r"""\b([A-Z0-9_]*_(?:API_KEY|SECRET|TOKEN|PASSWORD|ENC_KEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?))(["']?\s*[:=]\s*)(?!["']?\[REDACTED\])(?:"[^"\n]*"|'[^'\n]*'|\S+)"""), r"\1\2[REDACTED]"),
     # App password: four 4-letter lowercase groups. That shape alone is ordinary
     # prose ("make sure that they ..."), so it is only treated as a secret within
     # 60 chars of an app-password keyword.

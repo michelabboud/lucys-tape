@@ -37,6 +37,12 @@ LEAK_RX = re.compile(
     # so the guard stays a strict SUBSET and can never flag what the redactor
     # missed — the deadlock this file exists to prevent.
     r"|[0-9]{8,}:[A-Za-z0-9_-]{35}"
+    # Headless private-key bodies by DER prefix — the same alternatives as the
+    # redactor's private_key_der_body, so the guard stays a subset.
+    r"|\b(MII[A-Za-z0-9+/]{3}(IBAAKCAQ|IBAAKCAgEA|IBADANBgkqhkiG9w0BAQEFAASC)|MHQCAQEEI|MIGHAgEAMBMGByqGSM49|b3BlbnNzaC1rZXktdjE)"
+    # Namespaced sk- keys (sk-proj-, sk-svcacct-, …): narrower than the redactor's
+    # openai_ns_key (lowercase namespace, hyphen only), so the guard stays a subset.
+    r"|\bsk-[a-z]{2,12}-[A-Za-z0-9_-]{20}"
 )
 
 FAKE_B64 = "MIIEpAIBAAKCAQEA" + "x" * 48  # 64-char base64-ish line, like real PEM body
@@ -63,6 +69,64 @@ class PemRedactionTests(unittest.TestCase):
         self.assertIn("[REDACTED PRIVATE KEY BLOCK]", out)
         self.assertNotIn(FAKE_B64, out)
         self.assert_guard_clean(out)
+
+    def test_headless_body_with_footer_is_redacted(self):
+        # Body + END footer, NO BEGIN header. The footer used to be defanged (guard
+        # passes) while every body token survived: a key shipped in the archive.
+        body = "y" * 64
+        out = redact(f"{body}\n{body}\n{body}\n-----END RSA PRIVATE KEY-----")
+        self.assertIn("[REDACTED PRIVATE KEY BLOCK]", out)
+        self.assertNotIn(body, out)
+        self.assert_guard_clean(out)
+
+    def test_env_file_cut_shape_is_redacted_but_names_survive(self):
+        # `cut -d= -f1` over an env file holding a multi-line PEM value prints the
+        # names, then the key's DER-prefixed first line, body tokens joined by spaces,
+        # the END footer with a stray quote, then more names. Body and prefix must go;
+        # the variable NAMES (harmless) stay readable.
+        prefix = "MIIEowIBAAKCAQEA13FNXnq6"
+        b1, b2 = "y" * 64, "z" * 64
+        text = (f"SERVICE_API_KEY APP_PRIVATE_KEY {prefix} {b1} {b2} "
+                f'-----END RSA PRIVATE KEY-----" APP_KEY_ALIAS OTHER_API_KEY')
+        out = redact(text)
+        for secret in (prefix, b1, b2):
+            self.assertNotIn(secret, out)
+        self.assertIn("APP_PRIVATE_KEY", out)
+        self.assertIn("APP_KEY_ALIAS", out)
+        self.assert_guard_clean(out)
+
+    def test_der_body_without_any_framing_is_redacted(self):
+        # PKCS#8: no header, no footer, just the base64, recognised by its DER prefix.
+        head = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
+        out = redact(f"key: {head}{'y' * 40} {'z' * 64} end")
+        self.assertIn("[REDACTED PRIVATE KEY BODY]", out)
+        self.assertNotIn("AASCBKcw", out)
+        self.assertNotIn("z" * 64, out)
+        self.assertIn("end", out)
+        self.assert_guard_clean(out)
+
+    def test_space_joined_truncated_block_is_redacted(self):
+        # Header + body joined by SPACES on one line, no footer. The old truncated
+        # rule only accepted newline-separated bodies.
+        body = "y" * 64
+        out = redact(f"-----BEGIN RSA PRIVATE KEY----- {body} {body}")
+        self.assertIn("[REDACTED PRIVATE KEY BLOCK]", out)
+        self.assertNotIn(body, out)
+        self.assert_guard_clean(out)
+
+    def test_public_key_certificate_and_csr_survive(self):
+        # Failure path for the DER rule: PUBLIC material must NOT be eaten. A public
+        # key reads ...AAOCAQ8..., a certificate ...TCCA..., a CSR ...ICAQAw...; none
+        # carry the private OCTET STRING marker.
+        for public in (
+            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA" + "y" * 40,
+            "MIIDXTCCAkWgAwIBAgIJAJC1HiIAZAiIMA0GCSqGSIb3DQEBBQUAMEUx" + "y" * 40,
+            "MIICijCCAXICAQAwRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUx" + "y" * 40,
+        ):
+            with self.subTest(public=public[:20]):
+                out = redact(f"cert: {public}")
+                self.assertEqual(out, f"cert: {public}")
+                self.assert_guard_clean(out)
 
     def test_bare_header_in_prose_is_defanged_and_readable(self):
         out = redact("the scanner looks for -----BEGIN RSA PRIVATE KEY----- in files")
@@ -165,6 +229,115 @@ class PemRedactionTests(unittest.TestCase):
         self.assertEqual(guard_line.split("=", 1)[1].strip("'"),
                          LEAK_RX.pattern.replace("\n", ""),
                          "tests/test_redact.py LEAK_RX mirror is out of sync with tools/tape")
+
+
+class CredentialShapeBlindSpotTests(unittest.TestCase):
+    """LT-SEC-002: credential shapes the redactor used to miss (July 2026 bughunt).
+
+    Every value below is fake. Each test names the shape and asserts the value is
+    gone; the near-miss tests at the end assert ordinary text survives.
+    """
+
+    def assert_gone(self, text, secret):
+        out = redact(text)
+        self.assertNotIn(secret, out, f"survived: {out}")
+        self.assertIsNone(LEAK_RX.search(out), f"guard would fire: {out}")
+        return out
+
+    def test_quoted_json_keys(self):
+        secret = "Zq8vLm2pXw7rTn4k"
+        for text in (f'{{"password": "{secret}"}}', f"{{'api_key': '{secret}'}}",
+                     f'{{"client_secret":"{secret}"}}', f'"token" : "{secret}",'):
+            with self.subTest(text=text):
+                self.assert_gone(text, secret)
+
+    def test_quoted_json_key_keeps_the_name_and_structure(self):
+        out = redact('{"password": "Zq8vLm2pXw7rTn4k", "user": "ada"}')
+        self.assertIn('"password"', out)
+        self.assertIn('"user": "ada"', out)
+
+    def test_prefixed_lowercase_names(self):
+        secret = "Zq8vLm2pXw7rTn4k"
+        for text in (f"db_password={secret}", f"smtp_password: {secret}",
+                     f"my_api_key = {secret}", f"stripe_secret_key={secret}"):
+            with self.subTest(text=text):
+                self.assert_gone(text, secret)
+
+    def test_cloud_secret_assignments(self):
+        aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzq8vLm2pXw"  # 40 chars, AWS secret shape
+        for text in (f"AWS_SECRET_ACCESS_KEY={aws}", f"export AWS_SECRET_ACCESS_KEY='{aws}'",
+                     f"aws_secret_access_key = {aws}", f'"AWS_SECRET_ACCESS_KEY": "{aws}"',
+                     f"AWS_SECRET_ACCESS_KEY: {aws}"):
+            with self.subTest(text=text):
+                self.assert_gone(text, aws)
+
+    def test_azure_account_key_in_connection_string(self):
+        key = "Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0jKl5mNo8pRs2tUv4wXy7zAa1bCc3dEe6fGg9hHi2jJk5lLm8nNo1pPq4r+w=="
+        out = self.assert_gone(
+            f"DefaultEndpointsProtocol=https;AccountName=acct;AccountKey={key};EndpointSuffix=core.windows.net",
+            key)
+        self.assertIn("AccountName=acct", out)
+
+    def test_padded_base64_followed_by_delimiters(self):
+        k32 = "Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0jKl5mNo8pRs2="   # 44 chars: 32 bytes
+        k31 = "Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0jKl5mNo8pRs=="   # double padding
+        for key in (k32, k31):
+            for text in (f"key {key} end", f'"{key}"', f"key={key},", f"{key}"):
+                with self.subTest(text=text):
+                    self.assert_gone(text, key)
+
+    def test_base64_starting_with_slash_or_plus(self):
+        key = "/q8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0jKl5mNo8pRs2="
+        self.assert_gone(f"secret {key} here", key[1:])
+
+    def test_namespaced_sk_keys(self):
+        body = "Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0j"
+        for key in (f"sk-proj-{body}", f"sk-svcacct-{body}", f"sk-admin-{body}",
+                    f"sk-or-v1-{body}", f"sk_live_{body}", f"sk_test_{body}",
+                    f"rk_live_{body}", f"sk-proj-{body[:10]}_{body[10:]}"):
+            with self.subTest(key=key):
+                self.assert_gone(f"key {key} leaked", body[-20:])
+
+    def test_short_wrapped_truncated_private_key(self):
+        # Footerless key wrapped at 32 columns: every body line is under 40 chars.
+        lines = ["Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0j", "Kl5mNo8pRs2tUv4wXy7zAa1bCc3dEe6f",
+                 "Gg9hHi2jJk5lLm8nNo1pPq4rSs7tTu0v"]
+        out = redact("-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n")
+        for line in lines:
+            self.assertNotIn(line, out)
+        self.assertIsNone(LEAK_RX.search(out))
+
+    def test_short_wrapped_headless_private_key(self):
+        lines = ["Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0j", "Kl5mNo8pRs2tUv4wXy7zAa1bCc3dEe6f"]
+        out = redact("\n".join(lines) + "\n-----END PRIVATE KEY-----")
+        for line in lines:
+            self.assertNotIn(line, out)
+
+    def test_namespaced_sk_guard_hit_is_always_redacted(self):
+        """The guard learned namespaced sk- keys; the redactor must stay a superset."""
+        rng = random.Random(20260928)
+        alphabet = string.ascii_letters + string.digits + "_-"
+        for _ in range(500):
+            ns = "".join(rng.choice(string.ascii_lowercase) for _ in range(rng.randint(2, 12)))
+            key = f"sk-{ns}-" + "".join(rng.choice(alphabet) for _ in range(rng.randint(20, 60)))
+            for tmpl in ("key {k}", "OPENAI_API_KEY={k}", '"api_key": "{k}"', "x={k}_y"):
+                out = redact(tmpl.format(k=key))
+                self.assertIsNone(LEAK_RX.search(out), f"guard would fire: {out}")
+
+    def test_near_misses_survive(self):
+        for text in (
+            "the password field is required",          # no value after a separator
+            "use scikit-learn and sk-learn-style APIs", # short sk- words
+            "password_hint = remember the dog",         # a different name
+            "git sha 3f2c1a9b8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b",
+            "a=b and c=d",
+            "https://example.com/a/b?x=1&y=2",
+            # CSP / Subresource Integrity hashes are public digests
+            "script-src 'self' 'sha256-uoFkiLr290rm6B9wdpdUCNJZ13JE4Zq8vLm2pXw7rTn='",
+            'integrity="sha384-' + "Zq8vLm2pXw7rTn4kQ1s9Yb3cVd6fGh0jKl5mNo8pRs2tUv4wXy7zAa1bCc3dEe6f" + '"',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(redact(text), text)
 
 
 class TelegramBotTokenTests(unittest.TestCase):
