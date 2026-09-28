@@ -8,11 +8,13 @@ table + FTS5 index) from them — a pure build artifact, never committed.
 It works on any clone of the repo with NO access to ~/.claude: the Markdown
 alone fully reconstructs the database. Run via `tape build`.
 """
+import importlib.util
 import json
 import os
 import re
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 ARCHIVE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "archive"
@@ -21,6 +23,10 @@ CONV_DIR = ARCHIVE / "conversations"
 # checks it, then swaps it in). Either way the build goes to a temporary file first and
 # replaces the target atomically, so a crash never leaves a half-built or missing DB.
 DB_PATH = Path(sys.argv[2]) if len(sys.argv) > 2 else ARCHIVE / "conversations.db"
+
+_spec = importlib.util.spec_from_file_location("safe_paths", Path(__file__).resolve().parent / "safe_paths.py")
+safe_paths = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(safe_paths)
 
 FAB = re.compile(r"^<!--fab (\{.*\})-->\s*$")
 TURN = re.compile(r"^<!--t role=(user|assistant|tool) kind=(dialogue|step|note) model=(\S*) ts=(\S*)-->\s*$")
@@ -73,7 +79,22 @@ def clean_meta(meta, stem):
     return out
 
 
-def parse_md(path):
+def archive_lines(path, root=None):
+    """The file's lines, read once. The file must be a regular file inside root (by
+    default its own folder); the archive holds no symlinks, so one is refused (LT-SEC-009).
+
+    Split on "\n" only, as the extractor writes and escapes: splitlines() also breaks on
+    \r, \f, U+2028 and others, and read_text() turns every \r into \n, both of which let
+    body text start a forged turn (LT-SEC-014)."""
+    text, _ = safe_paths.read_source_text(path, root or Path(path).parent, follow_links=False)
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
+
+
+def parse_md(path, root=None):
+    return parse_lines(archive_lines(path, root))
+
+
+def parse_lines(lines):
     meta, turns = None, []
     cur = None      # (role, kind, model, ts)
     buf = []
@@ -90,11 +111,7 @@ def parse_md(path):
         lines = [ln[len(BODY_ESC):] if ln.startswith(BODY_ESC) else ln for ln in lines]
         turns.append((*cur, "\n".join(lines).strip()))
 
-    # split on "\n" only, as the extractor writes and escapes: splitlines() also breaks
-    # on \r, \f, U+2028 and others, and read_text() turns every \r into \n, both of
-    # which let body text start a forged turn (LT-SEC-014). Raw bytes, then "\n".
-    for line in (ln[:-1] if ln.endswith("\r") else ln
-                 for ln in path.read_bytes().decode("utf-8", "replace").split("\n")):
+    for line in lines:
         m = FAB.match(line)
         if m and meta is None:
             try:
@@ -128,12 +145,8 @@ def init_db(con):
     """)
 
 
-def title_of(path):
-    # split on "\n" only, as the extractor writes and escapes: splitlines() also breaks
-    # on \r, \f, U+2028 and others, and read_text() turns every \r into \n, both of
-    # which let body text start a forged turn (LT-SEC-014). Raw bytes, then "\n".
-    for line in (ln[:-1] if ln.endswith("\r") else ln
-                 for ln in path.read_bytes().decode("utf-8", "replace").split("\n")):
+def title_of(lines):
+    for line in lines:
         if line.startswith("# "):
             return line[2:].strip()
     return "untitled conversation"
@@ -143,8 +156,10 @@ def main():
     if not CONV_DIR.exists():
         print(f"No conversations at {CONV_DIR}. Run extract first.")
         sys.exit(1)
-    tmp = DB_PATH.with_name(f"{DB_PATH.name}.tmp-{os.getpid()}")
-    tmp.unlink(missing_ok=True)
+    # a new file of our own (O_EXCL), never a name someone could have planted a link at
+    fd, tmp = tempfile.mkstemp(prefix=f"{DB_PATH.name}.tmp-", dir=DB_PATH.parent)
+    os.close(fd)
+    tmp = Path(tmp)
     try:
         n = build(tmp)
         os.replace(tmp, DB_PATH)
@@ -161,7 +176,12 @@ def build(db_path):
     init_db(con)
     n = 0
     for md in sorted(CONV_DIR.rglob("*.md")):
-        meta, turns = parse_md(md)
+        try:
+            lines = archive_lines(md, CONV_DIR)
+        except safe_paths.Refused as e:
+            print(f"skipped {md.name}: {e.strerror}", file=sys.stderr)
+            continue
+        meta, turns = parse_lines(lines)
         if meta is None:
             continue
         meta = clean_meta(meta, md.stem)
@@ -175,7 +195,7 @@ def build(db_path):
         con.execute("DELETE FROM turns WHERE session_id = ?", (sid,))
         con.execute("DELETE FROM fts WHERE session_id = ?", (sid,))
         con.execute("INSERT OR REPLACE INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (sid, meta["project"], title_of(md), meta["started"], meta["ended"],
+                    (sid, meta["project"], title_of(lines), meta["started"], meta["ended"],
                      meta["n_dialogue"], meta["user_turns"], meta["assistant_turns"],
                      meta["n_steps"], meta["models"], meta["branch"], rel))
         dbody, sbody = [], []
@@ -184,7 +204,7 @@ def build(db_path):
                         (sid, i, role, kind, clean_ts(ts), model[:MAX_TEXT["models"]], text))
             (dbody if kind in ("dialogue", "note") else sbody).append(text)
         proj = meta["project"]
-        title = title_of(md)
+        title = title_of(lines)
         con.execute("INSERT INTO fts VALUES (?,?,?,?,?)", (sid, "dialogue", proj, title, "\n".join(dbody)))
         if sbody:
             con.execute("INSERT INTO fts VALUES (?,?,?,?,?)", (sid, "step", proj, title, "\n".join(sbody)))

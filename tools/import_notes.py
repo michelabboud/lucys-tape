@@ -25,6 +25,7 @@ Usage: python3 tools/import_notes.py <notes_dir> [archive_dir] [--glob 'PATTERN'
 """
 import importlib.util
 import json
+import io
 import os
 import re
 import sys
@@ -37,6 +38,7 @@ _ec = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_ec)
 redact, slugify, _red = _ec.redact, _ec.slugify, _ec._red
 meta_text, path_component, escape_body = _ec.meta_text, _ec.path_component, _ec.escape_body
+safe_paths = _ec.safe_paths
 
 _args = [a for a in sys.argv[1:] if not a.startswith("--")]
 GLOB = "*.txt"
@@ -52,8 +54,8 @@ OUT_DIR = ARCHIVE / "conversations" / PROJECT
 MIN_BYTES = 200
 
 
-def mtime_iso(path):
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def mtime_iso(mtime):
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def derive_title(text, fallback):
@@ -65,15 +67,19 @@ def derive_title(text, fallback):
 
 
 def load_candidates(notes_dir):
-    """Readable captures, redacted, with skip reasons for the rest."""
+    """Readable captures as (path, redacted text, mtime), with skip reasons for the rest.
+
+    Each file is opened once and its size and time come from that open (LT-SEC-009): a
+    match of the glob that resolves outside the notes folder, or is not a regular file,
+    is refused and listed with the skips."""
     kept, skipped = [], []
     for p in sorted(notes_dir.glob(GLOB)):
         try:
-            size = p.stat().st_size
-            if size < MIN_BYTES:
-                skipped.append((p.name, f"jotting ({size}B < {MIN_BYTES}B)"))
+            text, st = safe_paths.read_source_text(p, notes_dir)
+            if st.st_size < MIN_BYTES:
+                skipped.append((p.name, f"jotting ({st.st_size}B < {MIN_BYTES}B)"))
                 continue
-            kept.append((p, redact(p.read_text(encoding="utf-8", errors="replace"))))
+            kept.append((p, redact(text), st.st_mtime))
         except OSError as e:
             skipped.append((p.name, f"unreadable: {e}"))
     return kept, skipped
@@ -81,27 +87,27 @@ def load_candidates(notes_dir):
 
 def drop_contained(candidates):
     """Drop captures whose normalized text is contained in a larger capture."""
-    norm = [(p, t, re.sub(r"\s+", " ", t).strip()) for p, t in candidates]
-    norm.sort(key=lambda x: len(x[2]))
+    norm = [(p, t, mt, re.sub(r"\s+", " ", t).strip()) for p, t, mt in candidates]
+    norm.sort(key=lambda x: len(x[3]))
     kept, dropped = [], []
-    for i, (p, t, n) in enumerate(norm):
-        container = next((q.name for q, _, m in norm[i + 1:] if len(m) > len(n) and n in m), None)
+    for i, (p, t, mt, n) in enumerate(norm):
+        container = next((q.name for q, _, _, m in norm[i + 1:] if len(m) > len(n) and n in m), None)
         if container:
             dropped.append((p.name, f"contained in {container}"))
         else:
-            kept.append((p, t))
+            kept.append((p, t, mt))
     return kept, dropped
 
 
-def write_note(path, text):
-    ts = mtime_iso(path)
+def write_note(path, text, mtime):
+    ts = mtime_iso(mtime)
     sid = f"note-{path_component(slugify(path.stem))}"
     title = meta_text(derive_title(text, path.stem))
     fab = {"sid": sid, "started": ts, "ended": ts, "models": "", "branch": "",
            "n_dialogue": 1, "user_turns": 1, "assistant_turns": 0, "n_steps": 0,
            "project": PROJECT}
-    out = OUT_DIR / f"{ts[:10]}__{path_component(slugify(title), 'untitled')}__{sid}.md"
-    with open(out, "w", encoding="utf-8") as f:
+    out = OUT_DIR / f"{safe_paths.date_prefix(ts)}__{path_component(slugify(title), 'untitled')}__{sid}.md"
+    with io.StringIO() as f:
         f.write(f"<!--fab {json.dumps(fab, separators=(',', ':'))}-->\n\n")
         f.write(f"# {title}\n\n| | |\n|---|---|\n")
         f.write(f"| **Project** | {PROJECT} |\n| **Saved** | {ts} |\n")
@@ -109,18 +115,19 @@ def write_note(path, text):
         f.write(f"| **Session** | `{sid}` |\n\n---\n")
         f.write(f"\n<!--t role=user kind=note model=- ts={ts}-->\n")
         f.write(f"### 📜 Note · {ts[:19].replace('T', ' ')}\n\n{escape_body(text)}\n")
+        safe_paths.write_text(out, f.getvalue(), ARCHIVE)
     return out
 
 
 def main():
     if not NOTES.is_dir():
         sys.exit(f"notes folder not found: {NOTES}")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE.mkdir(parents=True, exist_ok=True)
     candidates, skipped = load_candidates(NOTES)
     candidates, contained = drop_contained(candidates)
-    written = [write_note(p, t) for p, t in candidates]
+    written = [write_note(p, t, mt) for p, t, mt in candidates]
 
-    with open(OUT_DIR / "README.md", "w", encoding="utf-8") as f:
+    with io.StringIO() as f:
         f.write("# 📜 notes-prehistory — the manual archive era\n\n"
                 f"Hand-saved conversation captures imported from a notes folder (`{meta_text(GLOB, 80)}`) — "
                 "the conversations saved by hand before the tape existed. Dates are file "
@@ -130,6 +137,7 @@ def main():
                 f"{len(contained)} skipped (re-saves contained in larger captures)\n\n"
                 "Skipped, for the record:\n\n"
                 + "".join(f"- `{meta_text(n, 120)}` — {meta_text(why, 200)}\n" for n, why in sorted(skipped + contained)))
+        safe_paths.write_text(OUT_DIR / "README.md", f.getvalue(), ARCHIVE)
 
     print(f"imported          : {len(written)}")
     print(f"skipped jottings  : {len(skipped)}")

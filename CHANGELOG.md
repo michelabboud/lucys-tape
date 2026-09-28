@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.21 — 2026-09-28 · every file stays in its folder
+
+### Security
+
+- **LT-SEC-009: reads and writes could leave their folders.**
+  - A crafted timestamp became part of a file name, so `../` in it could place a
+    conversation outside the archive. A file name's date must now be a date
+    (`0000-00-00` otherwise).
+  - A session or note is read only when it resolves to a regular file inside its source
+    folder. Claude Code's links between subagent sessions still work; a link that leads
+    outside, a FIFO or a folder is refused and listed with the skipped sources. The check
+    is made on the opened file, so it cannot be swapped between check and read, and a
+    note's size and date come from that same open.
+  - Every archive file (conversations, `INDEX.md`, `REDACTION-REPORT.txt`, imported notes,
+    the leak guard's rewrites) is written as a new private file next to the target and
+    renamed over it. A link planted at the target is replaced, never written through; a
+    linked folder on the way is refused; a crash leaves the old file or the new one.
+  - The database builder and the leak guard refuse symlinks in the archive (the tools
+    never create one), and the builder reads each file once. Its temporary database is a
+    fresh file of its own, not a predictable name.
+- Measured on a real machine's sources: 6,383 sessions scanned and 5,580 conversations
+  written, identical to 0.2.20; the only files that differed were two sessions still being
+  written during the comparison.
+
+### Notes
+
+- Windows has no folder-descriptor calls in Python, so there the folders on the way are
+  checked just before writing instead. Phase 2 revisits it.
+- A write interrupted by a crash can leave a hidden `.<name>.<pid>.tmp` beside its target;
+  git ignores these, and the commit gate never stages them.
+
 ## v0.2.20 — 2026-09-28 · the viewer, after its review
 
 Fixes from the deep review of 0.2.19.

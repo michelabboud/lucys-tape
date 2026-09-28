@@ -186,9 +186,11 @@ acquire_lock() {
 # we MASK every residual LEAK_RX hit in place — over-redaction beats any leak — and
 # let the commit proceed. Each affected file + hit-count is logged (never the value),
 # so the redactor can still be hardened at source. Prints "<files> <hits>".
-mask_leaks() { python3 - "$ARCHIVE" "$LEAK_RX" "$LOG" <<'PY'
+mask_leaks() { python3 - "$ARCHIVE" "$LEAK_RX" "$LOG" "$REPO/tools" <<'PY'
 import os, re, sys
 root, rx_src, logpath = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, sys.argv[4])
+import safe_paths  # read and rewrite without following links (LT-SEC-009)
 rx = re.compile(rx_src, re.ASCII)  # same \b as grep in the C locale and the redactor
 # A mask covers the whole token, not just the part the guard's pattern names: the
 # guard matches e.g. the first 20 characters of a key, and the rest must go too.
@@ -209,13 +211,19 @@ with open(logpath, "a", encoding="utf-8") as lg:
                 continue
             p = os.path.join(dp, fn)
             try:
-                txt = open(p, encoding="utf-8").read()
+                fh, _ = safe_paths.open_source(p, root, follow_links=False)
+                with fh:
+                    txt = fh.read().decode("utf-8")
+            except safe_paths.Refused as e:
+                # never rewritten; the commit gate refuses links and non-regular files too
+                lg.write(f"  guard-mask: WARN skipped {shown(p)}: {e.strerror}\n")
+                continue
             except Exception as e:
                 lg.write(f"  guard-mask: WARN unreadable {shown(p)}: {type(e).__name__}\n")
                 continue
             new, n = mask_rx.subn(MARK, txt)
             if n:
-                open(p, "w", encoding="utf-8").write(new)
+                safe_paths.write_text(p, new, root)
                 files += 1; hits += n
                 lg.write(f"  guard-mask: masked {n} residual secret(s) in {shown(p)}\n")
 print(f"{files} {hits}")

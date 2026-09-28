@@ -18,6 +18,8 @@ only ever stores diffable text and never a binary blob.
   <out>/REDACTION-REPORT.txt
 """
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -32,6 +34,18 @@ PROJECTS = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "archive"
 CONV_DIR = OUT / "conversations"
+
+_spec = importlib.util.spec_from_file_location("safe_paths", Path(__file__).resolve().parent / "safe_paths.py")
+safe_paths = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(safe_paths)
+date_prefix, write_text = safe_paths.date_prefix, safe_paths.write_text
+
+
+def source_text(path, root):
+    """A session file opened for reading as text, refused unless it is a regular file
+    inside root (LT-SEC-009). Lines are streamed: sessions can be large."""
+    fh, _ = safe_paths.open_source(path, root)
+    return io.TextIOWrapper(fh, encoding="utf-8", errors="replace")
 
 # ---- secret scrubbing (applied to every stored string) ----------------------
 # The redactor is the PRIMARY filter. tools/tape carries an independent leak
@@ -228,7 +242,7 @@ _red = Counter()
 _skipped = []   # (path, reason) for every source we could not read
 
 
-def safe_parse(parse, path):
+def safe_parse(parse, path, root):
     """Parse one session file, surviving a source we cannot read.
 
     The sources are outside our control and READ-ONLY to us, so we never repair
@@ -244,9 +258,12 @@ def safe_parse(parse, path):
     This stays fail-SOFT only because the pipeline fails CLOSED downstream: the
     sanity floor and shrink ratchet in `tools/tape` refuse to commit an archive
     whose conversation count collapses, so mass source loss still aborts the run.
+
+    A source outside its root, or not a regular file, is refused the same way
+    (LT-SEC-009): recorded, skipped, reported.
     """
     try:
-        return parse(path)
+        return parse(path, root)
     except OSError as e:
         _skipped.append((path, e.strerror or e.__class__.__name__))
         return None
@@ -370,13 +387,13 @@ def clean_user(text):
     return LOCALCMD.sub("", SYSREMINDER.sub("", text or "")).strip()
 
 
-def parse_session(path):
+def parse_session(path, root=None):
     title = None
     started = ended = None
     models, branches, cwds = set(), set(), set()
     turns = []   # (role, kind, ts, model, text)
     u = a = steps = 0
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    with source_text(path, root or Path(path).parent) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -671,7 +688,7 @@ def codex_title(user_msgs, n=80):
     return None
 
 
-def parse_codex_session(path):
+def parse_codex_session(path, root=None):
     """Parse one codex rollout JSONL into the shared conversation meta shape."""
     sid = path.stem
     started = ended = None
@@ -680,7 +697,7 @@ def parse_codex_session(path):
     turns = []
     u = a = steps = 0
     cur_model = ""
-    with open(path, encoding="utf-8", errors="replace") as fh:
+    with source_text(path, root or Path(path).parent) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -755,13 +772,15 @@ def parse_codex_session(path):
     }
 
 
-def write_markdown(meta, project, path):
+def write_markdown(meta, project, path, root=None):
+    """Write one conversation. root is the folder the file must stay inside (the archive);
+    by default the file's own folder."""
     fab = {k: meta[k] for k in ("sid", "started", "ended", "models", "branch",
                                 "n_dialogue", "user_turns", "assistant_turns", "n_steps")}
     fab["project"] = project
     if meta.get("engine"):          # absent = claude (back-compat)
         fab["engine"] = meta["engine"]
-    with open(path, "w", encoding="utf-8") as out:
+    with io.StringIO() as out:
         out.write(f"<!--fab {json.dumps(fab, separators=(',', ':'))}-->\n\n")
         out.write(f"# {meta['title']}\n\n| | |\n|---|---|\n")
         out.write(f"| **Project** | {project} |\n| **Started** | {meta['started']} |\n")
@@ -782,6 +801,7 @@ def write_markdown(meta, project, path):
                 who = f"🤖 {model or 'Claude'}"
             stamp = f" · {ts[:19].replace('T', ' ')}" if ts else ""
             out.write(f"### {who}{stamp}\n\n{text}\n")
+        write_text(path, out.getvalue(), root or Path(path).parent)
 
 
 def main():
@@ -796,25 +816,22 @@ def main():
         label = path_component(project_label(proj_dir.name))
         for f in files:
             scanned += 1
-            meta = safe_parse(parse_session, f)
+            meta = safe_parse(parse_session, f, PROJECTS)
             if not meta:
                 continue
             meta["sid"] = sid = path_component(meta["sid"])
             if sid in seen and meta["chars"] <= seen[sid]:
                 continue
             seen[sid] = meta["chars"]
-            proj_out = CONV_DIR / label
-            proj_out.mkdir(parents=True, exist_ok=True)
-            date = (meta["started"] or "0000-00-00")[:10]
-            write_markdown(meta, label, proj_out / f"{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md")
-            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"],
-                          f"conversations/{label}/{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"))
+            rel = f"conversations/{label}/{date_prefix(meta['started'])}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"
+            write_markdown(meta, label, OUT / rel, OUT)
+            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel))
             kept += 1
     # ---- codex source (optional; same shelves, same pipeline) ----------------
     if CODEX_SESSIONS.is_dir():
         for f in sorted(CODEX_SESSIONS.rglob("rollout-*.jsonl")):
             scanned += 1
-            meta = safe_parse(parse_codex_session, f)
+            meta = safe_parse(parse_codex_session, f, CODEX_SESSIONS)
             if not meta:
                 continue
             meta["sid"] = sid = path_component(meta["sid"])
@@ -822,15 +839,12 @@ def main():
                 continue
             seen[sid] = meta["chars"]
             label = path_component(meta["project"], "codex-misc")
-            proj_out = CONV_DIR / label
-            proj_out.mkdir(parents=True, exist_ok=True)
-            date = (meta["started"] or "0000-00-00")[:10]
-            write_markdown(meta, label, proj_out / f"{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md")
-            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"],
-                          f"conversations/{label}/{date}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"))
+            rel = f"conversations/{label}/{date_prefix(meta['started'])}__{path_component(slugify(meta['title']), 'untitled')}__{sid}.md"
+            write_markdown(meta, label, OUT / rel, OUT)
+            index.append((meta["started"] or "", label, meta["title"], meta["n_dialogue"], meta["n_steps"], meta["models"], rel))
             kept += 1
     index.sort(reverse=True)
-    with open(OUT / "INDEX.md", "w", encoding="utf-8") as idx:
+    with io.StringIO() as idx:
         idx.write(f"# 📼 Lucy's Tape — Conversation Archive\n\n**{kept} conversations**, secret-scrubbed, "
                   f"from {scanned} session files. The DB is rebuilt from these files with "
                   f"`tape build`. Newest first.\n\n---\n\n")
@@ -841,10 +855,12 @@ def main():
                 cur = label
             link_text = re.sub(r"([\[\]()\\])", r"\\\1", title)
             idx.write(f"- `{(started or '')[:10]}` [{link_text}]({rel}) — {nd} turns · {ns} steps · {(models.split(',')[0].strip() if models else '?')}\n")
-    with open(OUT / "REDACTION-REPORT.txt", "w", encoding="utf-8") as rep:
+        write_text(OUT / "INDEX.md", idx.getvalue(), OUT)
+    with io.StringIO() as rep:
         rep.write(f"Secret-scrub report — {sum(_red.values())} redactions (values never stored).\n\n")
         for label, n in _red.most_common():
             rep.write(f"  {n:6d}  {label}\n")
+        write_text(OUT / "REDACTION-REPORT.txt", rep.getvalue(), OUT)
     print(f"sessions scanned     : {scanned}")
     print(f"conversations written: {kept}")
     print(f"secret redactions    : {sum(_red.values())}")

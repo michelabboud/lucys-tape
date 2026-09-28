@@ -64,12 +64,12 @@ class ImportNotesTests(unittest.TestCase):
             "A long conversation capture with a leaked key " + secret + "\n" + "more text " * 40)
         kept, _ = self.mod.load_candidates(self.notes)
         self.assertEqual(len(kept), 1)
-        path, text = kept[0]
+        path, text, mtime = kept[0]
         self.assertNotIn(secret, text)
         self.assertIn("[REDACTED sk-key]", text)
         # and the written note round-trips through the build parser
-        self.mod.OUT_DIR.mkdir(parents=True, exist_ok=True)
-        out = self.mod.write_note(path, text)
+        self.archive.mkdir()
+        out = self.mod.write_note(path, text, mtime)
         spec = importlib.util.spec_from_file_location("build_db", TOOLS / "build_db.py")
         build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(build)
