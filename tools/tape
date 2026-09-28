@@ -83,6 +83,13 @@ root, rx_src, logpath = sys.argv[1], sys.argv[2], sys.argv[3]
 rx = re.compile(rx_src, re.ASCII)  # same \b as grep in the C locale and the redactor
 MARK = "[****REDACTED-BY-GUARD****]"  # asterisked; matches no LEAK_RX (idempotent); greppable for audit
 files = hits = 0
+
+
+def shown(p):
+    rel = os.path.relpath(p, root)
+    return "(a file whose name matches the leak guard; name withheld)" if rx.search(rel) else rel
+
+
 with open(logpath, "a", encoding="utf-8") as lg:
     for dp, _, fns in os.walk(root):
         for fn in fns:
@@ -92,14 +99,51 @@ with open(logpath, "a", encoding="utf-8") as lg:
             try:
                 txt = open(p, encoding="utf-8").read()
             except Exception as e:
-                lg.write(f"  guard-mask: WARN unreadable {os.path.relpath(p, root)}: {type(e).__name__}\n")
+                lg.write(f"  guard-mask: WARN unreadable {shown(p)}: {type(e).__name__}\n")
                 continue
             new, n = rx.subn(MARK, txt)
             if n:
                 open(p, "w", encoding="utf-8").write(new)
                 files += 1; hits += n
-                lg.write(f"  guard-mask: masked {n} residual secret(s) in {os.path.relpath(p, root)}\n")
+                lg.write(f"  guard-mask: masked {n} residual secret(s) in {shown(p)}\n")
 print(f"{files} {hits}")
+PY
+}
+
+# Staged-content gate (LT-SEC-003). The update may commit ONLY what it generated:
+# archive/INDEX.md, archive/REDACTION-REPORT.txt and archive/conversations/**.md. Every staged path is checked
+# against that list and against LEAK_RX, and every staged BLOB (the exact bytes git
+# will commit, not the working tree) is scanned. Prints the number of violations;
+# details go to the log with any matching name withheld.
+staged_guard() { python3 - "$LEAK_RX" "$LOG" <<'PY'
+import re, subprocess, sys
+rx, logpath = re.compile(sys.argv[1], re.ASCII), sys.argv[2]
+ALLOWED = re.compile(r"^archive/(INDEX\.md|REDACTION-REPORT\.txt|conversations/.+\.md)$")
+names = subprocess.run(["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
+                       check=True, capture_output=True).stdout.decode("utf-8", "surrogateescape")
+paths = [p for p in names.split("\0") if p]
+bad = []
+for n, p in enumerate(paths, 1):
+    if rx.search(p):
+        bad.append(f"staged path #{n} matches the leak guard (name withheld)")
+    elif not ALLOWED.match(p):
+        bad.append(f"staged path outside the archive: {p}")
+live = [p for p in paths if subprocess.run(["git", "cat-file", "-e", f":{p}"], capture_output=True).returncode == 0]
+if live:
+    out = subprocess.run(["git", "cat-file", "--batch"], input="".join(f":{p}\n" for p in live).encode("utf-8", "surrogateescape"),
+                         check=True, capture_output=True).stdout
+    pos = 0
+    for n, p in enumerate(live, 1):
+        header_end = out.index(b"\n", pos)
+        size = int(out[pos:header_end].split()[2])
+        blob = out[header_end + 1:header_end + 1 + size].decode("utf-8", "replace")
+        pos = header_end + 1 + size + 1
+        if rx.search(blob):
+            bad.append(f"staged content #{n} matches the leak guard" + ("" if rx.search(p) else f": {p}"))
+with open(logpath, "a", encoding="utf-8") as lg:
+    for b in bad:
+        lg.write(f"  staged-guard: {b}\n")
+print(len(bad))
 PY
 }
 
@@ -152,9 +196,15 @@ preflight() {
 cmd_update() {
     acquire_lock || { say "another refresh is already running — exiting"; exit 0; }
 
-    local free_gb; free_gb="$(preflight)"
+    mkdir -p "$ARCHIVE" || die "cannot create $ARCHIVE"
+    # preflight runs in a subshell to capture its output, so its `die` only ends that
+    # subshell: the status must be checked here, or a refusal (low disk) is ignored.
+    local free_gb; free_gb="$(preflight)" || { echo "$free_gb"; exit 1; }
     say "refresh starting (${free_gb}GB free)"; log "refresh starting (${free_gb}GB free)"
     cd "$REPO" || die "cannot cd to repo"
+    # Commit only our own output (LT-SEC-003): if anything is already staged, it is
+    # someone's work in progress, and `git commit` would sweep it into the archive commit.
+    git diff --cached --quiet 2>>"$LOG" || die "the git index already has staged changes — commit or unstage them first (refusing to commit work that is not the archive's)"
 
     # Ratchet: remember the archive size BEFORE this refresh. A rebuilt archive
     # that shrinks below half the previous count means the extractor (or the
@@ -191,8 +241,13 @@ cmd_update() {
     ok "leak guard passed (output verified clean)"
 
     # 3. commit ONLY the diffable Markdown (the DB is git-ignored, never committed)
-    local rc=0
-    git add -A
+    local rc=0 bad
+    git add -A -- archive/ 2>>"$LOG" || { git reset -q -- archive/ 2>>"$LOG"; die "git add failed — nothing committed (see: tape logs)"; }
+    bad="$(staged_guard)" || { git reset -q -- archive/ 2>>"$LOG"; die "staged-content check crashed — nothing committed (see: tape logs)"; }
+    if [ "${bad:-1}" != "0" ]; then
+        git reset -q -- archive/ 2>>"$LOG"
+        die "staged-content check: ${bad} problem(s) — nothing committed (see: tape logs)"
+    fi
     if git diff --cached --quiet; then
         ok "no changes to commit"
     elif git commit -q -m "chore: refresh archive ($(date -u +%Y-%m-%dT%H:%MZ))"; then

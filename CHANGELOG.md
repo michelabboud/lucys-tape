@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.7 — 2026-09-28 · the nightly commit holds only the archive
+
+### Security
+
+- **LT-SEC-003: the update staged the whole repository.** It ran `git add -A`, so anything in
+  the checkout (a note, a local edit, a file someone had staged) went into the archive commit
+  and was pushed, while the leak guard only checked `archive/conversations/*.md`. Now:
+  - the update refuses to start if anything is already staged;
+  - it stages only `archive/`, and every git step's failure stops the commit;
+  - before committing, it checks every staged path against an allow-list
+    (`archive/INDEX.md`, `archive/REDACTION-REPORT.txt`, `archive/conversations/**.md`) and
+    against the leak guard, and scans the exact staged bytes (what git will commit, not the
+    working tree) with the leak guard. Any problem unstages the archive and commits nothing.
+- The staged-content check also stops a leak found while writing its test (LT-SEC-005, fixed at
+  the source in a later task): a secret in a project folder's name reached `archive/INDEX.md`
+  and the file path, neither of which the Markdown masker covers.
+- The masker's log no longer writes out a file name that itself matches the leak guard.
+
+### Fixed
+
+- **The low-disk refusal never stopped anything.** The free-space check ran inside `$(…)`, so its
+  exit only ended a subshell and the update carried on; its message was swallowed too. It now
+  stops the update and says why.
+- On a fresh install the `archive/` folder did not exist yet, so the first run could not write its
+  log. It is created first.
+
+### Tests
+
+- `tests/test_tape_cli.py`: end-to-end runs of `tape update` in a throwaway repo with a local
+  remote, a fake home folder and a fake `gh` that always fails, so no test can reach a real
+  account. All 5 fail against 0.2.6.
+
 ## v0.2.6 — 2026-09-28 · the redactor's re-review findings
 
 ### Fixed
