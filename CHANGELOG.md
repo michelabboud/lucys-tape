@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.3 — 2026-09-28 · repo paperwork and the safe-everywhere plan
+
+### Added
+
+- Repo paperwork: `PLAN.md`, `BACKLOG.md`, `HANDOFF.md`, `SECURITY.md` (GitHub private vulnerability reporting is on), `CONTRIBUTING.md`, `.env.example`, and the 2026-09-28 safe-everywhere plan.
+
 ## v0.2.2 — 2026-08-06 · codex tool steps carry their command again
 
 ### Fixed
