@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.13 — 2026-09-28 · the DB-order review findings
+
+### Security
+
+- **A refused refresh no longer feeds the weekly backup or release.** When the commit or its
+  checks failed, the Sunday (or `TAPE_FORCE_DB_DAILY`) backup and release snapshot still ran and
+  could carry what the check had refused; they are now skipped.
+- **The leak guard masks every file the archive publishes:** `INDEX.md` and the redaction report
+  as well as the conversations, and its backstop check covers them too.
+- **A guard mask covers the whole key.** The guard's pattern names a key's first characters (for
+  example 20 after `sk-proj-`); masking stopped there and left the rest of the key visible.
+- `tape build` and `tape backup` run the same mask-and-verify step before reading the Markdown,
+  in case an update was interrupted between extraction and masking.
+
+### Fixed
+
+- Side files of an interrupted DB build are ignored by git and removed at the start of the next
+  update, so they neither pile up nor trigger a nightly "left uncommitted" warning.
+
+### Tests
+
+- The shrink ratchet (a rebuild with less than half the conversations) is now tested directly;
+  the earlier test only reached the minimum-count floor.
+
 ## v0.2.12 — 2026-09-28 · the database is built from the verified Markdown, and never lost
 
 ### Security

@@ -1,6 +1,8 @@
 # Build artifacts — the Markdown is the source of truth, the DB is disposable
 archive/conversations.db
 archive/conversations.db.gz
+# side files of an interrupted DB build (removed at the start of the next update)
+archive/conversations.db.*
 archive/*.log
 __pycache__/
 *.pyc

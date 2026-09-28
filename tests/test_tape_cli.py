@@ -125,6 +125,52 @@ class TapeUpdateTests(TapeRepoCase):
         self.assertEqual(self.db_text(), before)
         self.assertFalse(list((self.repo / "archive").glob("conversations.db.*")))
 
+    def test_the_shrink_ratchet_keeps_the_last_good_db(self):
+        for i in range(12):
+            self.add_session("-home-u-proj", f"keep-{i:04d}", f"conversation {i}")
+        self.assertEqual(self.update().returncode, 0)
+        before = self.db_text()
+        for i in range(8):  # 13 conversations -> 5: less than half, but above the floor
+            (self.home / ".claude" / "projects" / "-home-u-proj" / f"keep-{i:04d}.jsonl").unlink()
+        for p in (self.repo / "archive" / "conversations").rglob("*keep-000[0-7]*.md"):
+            p.unlink()
+        r = self.update()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("shrank", r.stdout)
+        self.assertEqual(self.db_text(), before)
+
+    def test_a_guard_mask_covers_the_whole_key(self):
+        d = self.home / ".claude" / "projects" / "-home-u-proj"
+        recs = [{"type": "user", "sessionId": "iiii-9999", "timestamp": "2026-09-01T10:00:00Z", "cwd": "/home/u/proj",
+                 "gitBranch": "sk-proj-" + "A" * 20 + "TAILTAILTAILTAIL", "message": {"role": "user", "content": "hi"}},
+                {"type": "assistant", "sessionId": "iiii-9999", "timestamp": "2026-09-01T10:00:05Z",
+                 "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": "ok"}]}}]
+        (d / "iiii-9999.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        self.update()
+        md = next((self.repo / "archive" / "conversations").rglob("*iiii-9999.md")).read_text()
+        self.assertNotIn("TAILTAIL", md)
+        self.assertNotIn("TAILTAIL", self.db_text())
+
+    def test_weekly_backup_and_release_skip_a_failed_refresh(self):
+        backups = self.tmp / "backups"
+        self.env.update(TAPE_FORCE_DB_DAILY="1", TAPE_BACKUP_DIR=str(backups))
+        self.add_session("-home-u-sk-proj-" + "C" * 30, "cccc-3333", "hi")  # the gate refuses this commit
+        r = self.update()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("skipped the weekly backup", r.stdout)
+        self.assertFalse(backups.exists() and any(backups.iterdir()))
+
+    def test_leftovers_of_an_interrupted_build_are_cleaned(self):
+        self.update()
+        a = self.repo / "archive"
+        for name in ("conversations.db.next", "conversations.db.next.tmp-123", "conversations.db.tmp-456"):
+            (a / name).write_bytes(b"x")
+        self.add_session("-home-u-proj", "jjjj-0000", "more")
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sorted(p.name for p in a.glob("conversations.db*")), ["conversations.db"])
+        self.assertNotIn("left uncommitted", r.stdout)
+
     def test_low_disk_refusal_stops_the_update(self):
         self.env["TAPE_MIN_FREE_GB"] = "999999999"
         head = self.git("rev-parse", "HEAD")

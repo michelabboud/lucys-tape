@@ -138,10 +138,13 @@ acquire_lock() {
 # we MASK every residual LEAK_RX hit in place — over-redaction beats any leak — and
 # let the commit proceed. Each affected file + hit-count is logged (never the value),
 # so the redactor can still be hardened at source. Prints "<files> <hits>".
-mask_leaks() { python3 - "$ARCHIVE/conversations" "$LEAK_RX" "$LOG" <<'PY'
+mask_leaks() { python3 - "$ARCHIVE" "$LEAK_RX" "$LOG" <<'PY'
 import os, re, sys
 root, rx_src, logpath = sys.argv[1], sys.argv[2], sys.argv[3]
 rx = re.compile(rx_src, re.ASCII)  # same \b as grep in the C locale and the redactor
+# A mask covers the whole token, not just the part the guard's pattern names: the
+# guard matches e.g. the first 20 characters of a key, and the rest must go too.
+mask_rx = re.compile(f"(?:{rx_src})[A-Za-z0-9_+/=-]*", re.ASCII)
 MARK = "[****REDACTED-BY-GUARD****]"  # asterisked; matches no LEAK_RX (idempotent); greppable for audit
 files = hits = 0
 
@@ -154,7 +157,7 @@ def shown(p):
 with open(logpath, "a", encoding="utf-8") as lg:
     for dp, _, fns in os.walk(root):
         for fn in fns:
-            if not fn.endswith(".md"):
+            if not (fn.endswith(".md") or fn == "REDACTION-REPORT.txt"):
                 continue
             p = os.path.join(dp, fn)
             try:
@@ -162,7 +165,7 @@ with open(logpath, "a", encoding="utf-8") as lg:
             except Exception as e:
                 lg.write(f"  guard-mask: WARN unreadable {shown(p)}: {type(e).__name__}\n")
                 continue
-            new, n = rx.subn(MARK, txt)
+            new, n = mask_rx.subn(MARK, txt)
             if n:
                 open(p, "w", encoding="utf-8").write(new)
                 files += 1; hits += n
@@ -339,11 +342,34 @@ commit_archive() {
     COMMITTED=1; ok "committed ${changes} archive change(s)"
 }
 
+# Mask residual secrets in every file the archive publishes (Markdown, INDEX.md, the
+# redaction report), then verify nothing matching the guard is left. Everything that
+# reads the Markdown (the commit, the DB, backups, releases) runs after this.
+mask_and_verify() {
+    say "leak guard: masking any residual secrets the redactor missed…"
+    local mask_out mf mh
+    mask_out="$(mask_leaks)" || { bad "leak-mask pass crashed — output unverified"; return 1; }
+    read -r mf mh <<<"$mask_out"
+    if [ "${mh:-0}" -gt 0 ]; then
+        warn "guard masked ${mh} residual secret(s) across ${mf} file(s) — harden the redactor at source (see: tape logs)"
+        log "guard-mask: ${mh} residual secret(s) masked across ${mf} file(s)"
+    else
+        ok "leak guard: output already clean (0 residual)"
+    fi
+    # backstop: if anything STILL matches after masking, masking itself is broken → fail-closed.
+    if LC_ALL=C grep -rlqE --include='*.md' --include='REDACTION-REPORT.txt' "$LEAK_RX" "$ARCHIVE" 2>/dev/null; then
+        bad "leak guard: pattern STILL present after masking (investigate the masker)"; return 1
+    fi
+    ok "leak guard passed (output verified clean)"
+}
+
 # ============================================================================
 cmd_update() {
     acquire_lock || { say "another refresh is already running — exiting"; exit 0; }
 
     mkdir -p "$ARCHIVE" || die "cannot create $ARCHIVE"
+    # leftovers of an interrupted DB build: our own side files, always regenerable
+    rm -f "$DB.next" "$DB".next.tmp-* "$DB".tmp-* "$DB".next-journal 2>/dev/null
     # preflight runs in a subshell to capture its output, so its `die` only ends that
     # subshell: the status must be checked here, or a refusal (low disk) is ignored.
     local free_gb; free_gb="$(preflight)" || { echo "$free_gb"; exit 1; }
@@ -358,22 +384,7 @@ cmd_update() {
     # 1. sources -> Markdown (the committed source of truth)
     say "extracting (read-only on sources)…"
     python3 "$EXTRACT" "$ARCHIVE" >>"$LOG" 2>&1 || die "extractor failed (see: tape logs)"
-    # leak guard: MASK residual secrets in place (never abort) — then commit clean output.
-    say "leak guard: masking any residual secrets the redactor missed…"
-    local mask_out mf mh
-    mask_out="$(mask_leaks)" || die "leak-mask pass crashed — refusing to commit (output unverified)"
-    read -r mf mh <<<"$mask_out"
-    if [ "${mh:-0}" -gt 0 ]; then
-        warn "guard masked ${mh} residual secret(s) across ${mf} file(s) — harden the redactor at source (see: tape logs)"
-        log "guard-mask: ${mh} residual secret(s) masked across ${mf} file(s)"
-    else
-        ok "leak guard: output already clean (0 residual)"
-    fi
-    # backstop: if anything STILL matches after masking, masking itself is broken → fail-closed.
-    if LC_ALL=C grep -rlqE "$LEAK_RX" "$ARCHIVE/conversations" 2>/dev/null; then
-        die "leak guard: pattern STILL present after masking — refusing to commit (investigate the masker)"
-    fi
-    ok "leak guard passed (output verified clean)"
+    mask_and_verify || die "leak guard failed — refusing to commit (see: tape logs)"
 
     # 2. verified Markdown -> DB (a local build artifact, git-ignored). Built only now,
     # from the masked and verified Markdown (LT-SEC-001: built before masking, the DB,
@@ -410,7 +421,9 @@ cmd_update() {
     local weekly=0
     [ "$(date +%u)" -eq 7 ] && weekly=1
     [ "$FORCE_DB_DAILY" = "1" ] && weekly=1
-    if [ "$weekly" -eq 1 ]; then
+    if [ "$weekly" -eq 1 ] && [ "$rc" -ne 0 ]; then
+        warn "skipped the weekly backup and release: this refresh did not commit cleanly"; log "weekly skipped (rc=$rc)"
+    elif [ "$weekly" -eq 1 ]; then
         _do_backup || rc=1
         _publish_db_snapshot || rc=1
     fi
@@ -421,6 +434,7 @@ cmd_update() {
 
 cmd_build() {
     [ -d "$ARCHIVE/conversations" ] || die "no Markdown to build from — run: tape update"
+    mask_and_verify || die "leak guard failed — not building (see: tape logs)"
     say "building DB from Markdown…"
     python3 "$BUILD" "$ARCHIVE" || die "build failed"
     ok "DB ready ($(db_count) conversations) → tape serve"
@@ -454,6 +468,7 @@ _publish_db_snapshot() {
 _do_backup() {
     [ -n "$BACKUP_DIR" ] || { warn "TAPE_BACKUP_DIR unset — skipped durable backup (set it to a second disk/cloud-synced folder)"; return 0; }
     mkdir -p "$BACKUP_DIR" || { warn "cannot create $BACKUP_DIR"; return 1; }
+    mask_and_verify || { warn "leak guard failed — no backup made"; return 1; }
     local stamp; stamp="$(date +%Y-%m-%d)"
     if tar -czf "$BACKUP_DIR/lucys-tape-archive-${stamp}.tar.gz" -C "$REPO" archive tools README.md 2>>"$LOG"; then
         ok "backup: lucys-tape-archive-${stamp}.tar.gz → $BACKUP_DIR"
