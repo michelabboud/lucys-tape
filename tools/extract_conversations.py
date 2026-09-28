@@ -95,7 +95,7 @@ REDACTIONS = [
     ("xai_key", re.compile(r"xai-[A-Za-z0-9]{20,}"), "[REDACTED xai-key]"),
     ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b"), "[REDACTED github-token]"),
     ("github_fine_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{40,}\b"), "[REDACTED github-pat]"),
-    ("aws_akid", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16,}"), "[REDACTED aws-key-id]"),
+    ("aws_akid", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}[A-Za-z0-9]*"), "[REDACTED aws-key-id]"),
     ("google_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "[REDACTED google-key]"),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "[REDACTED slack-token]"),
     # Telegram bot tokens: <bot_id>:<35-char secret>. Two patterns, because the
@@ -141,12 +141,12 @@ REDACTIONS = [
     # {"password": "x"} becomes {"password": "[REDACTED]"} and stays valid JSON.
     # A quoted value is taken whole, up to its closing quote, so a passphrase with
     # spaces or a comma, or a short one, cannot survive in part (LT-SEC-002 review).
-    ("assignment_quoted", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*)(["'])(?!\[REDACTED\]\3)(?:\\.|(?!\3)[^\\\n])+\3"""), r"\1\2\3[REDACTED]\3"),
-    ("assignment", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*["']?)(?!\[REDACTED\])([^\s"',;]{6,})"""), r"\1\2[REDACTED]"),
+    ("assignment_quoted", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*)(["'])(?!\[REDACTED[\] ])(?:\\.|(?!\3)[^\\\n])+\3"""), r"\1\2\3[REDACTED]\3"),
+    ("assignment", re.compile(r"""(?ix)(?<![A-Za-z0-9])(password|passwd|pwd|secret|secret[_-]?key|token|service[_-]?token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|enc[_-]?key|master[_-]?key|vault[_-]?key)\b(["']?\s*[:=]\s*["']?)(?!\[REDACTED[\] ])([^\s"',;]{6,})"""), r"\1\2[REDACTED]"),
     # Upper-case env names ending in a secret-ish suffix. Unquoted values are taken to
     # the next whitespace; quoted ones whole. An already-redacted value is left alone,
     # so this rule never undoes the separator the rule above kept.
-    ("env_named", re.compile(r"""\b([A-Z0-9_]*_(?:API_KEY|SECRET|TOKEN|PASSWORD|ENC_KEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?))(["']?\s*[:=]\s*)(?!["']?\[REDACTED\])(?:"[^"\n]*"|'[^'\n]*'|\S+)"""), r"\1\2[REDACTED]"),
+    ("env_named", re.compile(r"""\b([A-Z0-9_]*_(?:API_KEY|SECRET|TOKEN|PASSWORD|ENC_KEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?))(["']?\s*[:=]\s*)(?!["']?\[REDACTED[\] ])(?:"[^"\n]*"|'[^'\n]*'|\S+)"""), r"\1\2[REDACTED]"),
     # App password: four 4-letter lowercase groups. That shape alone is ordinary
     # prose ("make sure that they ..."), so it is only treated as a secret within
     # 60 chars of an app-password keyword.
@@ -191,6 +191,8 @@ def _redact_headless_keys(text):
                     j -= 1
                 elif j - 2 >= last and text[j - 2] == "\\" and text[j - 1] in "nr":
                     j -= 2
+                elif text[j - 1] == "-" and j - 1 > last and text[j - 2] in "\r\n":
+                    j -= 1  # a removed line in a diff: `-<body>`
                 else:
                     break
             if j == i and i != m.start():
@@ -202,7 +204,9 @@ def _redact_headless_keys(text):
                 if text[k - 1] in "nr" and k - 2 >= last and text[k - 2] == "\\":
                     break  # a literal \n / \r separates lines
                 k -= 1
-            if j - k < 16 or (k > last and not (text[k - 1].isspace() or text[k - 1] in "\"'`:=(\\n")):
+            before = text[k - 1] if k > last else ""
+            diff_minus = before == "-" and (k - 1 == 0 or text[k - 2] in "\r\n")
+            if j - k < 16 or (before and not (before.isspace() or before in "\"'`:=(\\nr" or diff_minus)):
                 break
             tokens, longest, start, i = tokens + 1, max(longest, j - k), k, k
         if start is not None and (tokens >= 2 or longest >= 40):
@@ -258,8 +262,10 @@ def report_skipped():
 def redact(text):
     if not text:
         return text
-    text = _redact_headless_keys(text)
     for label, rx, repl in REDACTIONS:
+        if label == "pem_header_bare":
+            # after full and truncated blocks are gone, before a bare footer is defanged
+            text = _redact_headless_keys(text)
         text, n = rx.subn(repl, text)
         if n:
             _red[label] += n

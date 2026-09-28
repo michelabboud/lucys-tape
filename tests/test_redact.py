@@ -447,6 +447,39 @@ class RedactorReviewRegressionTests(unittest.TestCase):
                 self.assertIsNone(LEAK_RX.search(redact(text)), redact(text))
 
 
+class RedactorReReviewTests(unittest.TestCase):
+    """Findings from the re-review of 0.2.5 (2026-09-28)."""
+
+    def test_aws_key_glued_to_another_key_leaves_nothing_for_the_guard(self):
+        for tail in ("sk-proj-" + "B" * 24, "sk-" + "B" * 20, "b3BlbnNzaC1rZXktdjE" + "B" * 20):
+            with self.subTest(tail=tail[:12]):
+                out = redact("AKIA" + "A" * 16 + tail)
+                self.assertIsNone(LEAK_RX.search(out), out)
+                self.assertEqual(redact(out), out)
+
+    def test_escaped_carriage_returns_separate_key_lines(self):
+        body = "Q" * 64
+        out = redact(f"{body}\\r{body}\\r-----END RSA PRIVATE KEY-----")
+        self.assertNotIn(body, out)
+
+    def test_headless_key_removed_in_a_diff(self):
+        body = "Q" * 64
+        out = redact(f"@@ -1,3 +0,0 @@\n-{body}\n-{body}\n------END RSA PRIVATE KEY-----\n")
+        self.assertNotIn(body, out)
+        self.assertIn("@@ -1,3 +0,0 @@", out)
+
+    def test_full_block_output_is_unchanged_from_before(self):
+        body = "Q" * 64
+        out = redact(f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----")
+        self.assertEqual(out, "[REDACTED PRIVATE KEY BLOCK]")
+
+    def test_spaced_marker_is_not_cut_in_half(self):
+        body = "Q" * 64
+        out = redact(f"PRIVATE_KEY={body}\n{body}\n-----END RSA PRIVATE KEY-----")
+        self.assertNotIn(body, out)
+        self.assertNotIn("[REDACTED] PRIVATE", out)
+
+
 class TelegramBotTokenTests(unittest.TestCase):
     """Telegram bot tokens: ``<bot_id>:<35-char secret>``.
 

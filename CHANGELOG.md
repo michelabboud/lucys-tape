@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.6 — 2026-09-28 · the redactor's re-review findings
+
+### Fixed
+
+- **An AWS key id glued to another key left that key for the guard to find** (ADR 0003): the
+  0.2.5 change let the AWS rule stop mid-run, so the `]` of its marker created a word boundary
+  in front of an `sk-` or OpenSSH body that the earlier rules had skipped. The rule now takes
+  the whole run. A fuzz of 80,000 inputs finds no guard hit on redactor output and no output
+  that changes when redacted twice.
+- A headless key whose lines are separated by a literal `\r`, and one removed in a diff
+  (every line starting with `-`), are redacted.
+- The headless scan now runs after the framed-key rules, so a full `BEGIN … END` block comes
+  out as one marker exactly as before (no one-time diff in existing archives).
+- A redaction marker with spaces is never cut in half by the assignment rules.
+
 ## v0.2.5 — 2026-09-28 · the redactor's review findings
 
 A deep review of 0.2.4 found one blocker and four gaps; all are fixed here, each with a test
