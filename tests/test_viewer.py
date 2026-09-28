@@ -451,6 +451,45 @@ class HttpTests(unittest.TestCase):
         self.assertIsNone(r.getheader("Set-Cookie"))
         c.close()
 
+    def test_other_servers_cookies_do_not_lock_the_user_out(self):
+        # browsers send every 127.0.0.1 cookie to every port; SimpleCookie gave up on
+        # the whole header at the first one it could not parse
+        mine = f"{self.v.COOKIE}={self.v.SESSION}"
+        for header in ('a={"x":1,"y":2}; ' + mine, "x=a b; " + mine, "weird@name=2; " + mine,
+                       mine + "; trailing=1", "lt_session=old; " + mine):
+            with self.subTest(header=header):
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/c/s1", headers={"Cookie": header})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    self.assertEqual(r.status, 200)
+
+    def test_a_wrong_cookie_among_others_is_still_refused(self):
+        code, _, _ = self._raw("/c/s1", {"Cookie": f"a=1; {self.v.COOKIE}=nope; b=2"})
+        self.assertEqual(code, 401)
+
+    def test_a_non_ascii_key_or_cookie_is_refused_cleanly(self):
+        self.assertEqual(self._raw("/?key=%C3%A9", {})[0], 403)
+        self.assertEqual(self._raw("/", {"Cookie": f"{self.v.COOKIE}=\u00e9".encode("latin-1").decode("latin-1")})[0], 401)
+
+    def test_the_redirect_after_the_key_stays_on_this_site(self):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", f"//evil.example/x?key={self.v.ACCESS_KEY}", headers={"Host": f"127.0.0.1:{self.port}"})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 303)
+        self.assertTrue(r.getheader("Location").startswith("/"))
+        self.assertFalse(r.getheader("Location").startswith("//"))
+
+    def _raw(self, path, headers):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", path, headers={"Host": f"127.0.0.1:{self.port}", **headers})
+        r = c.getresponse()
+        body = r.read().decode("utf-8", "replace")
+        c.close()
+        return r.status, r, body
+
     def test_no_store_and_no_framing(self):
         _, h, _ = self.get("/")
         self.assertEqual(h.get("Cache-Control"), "no-store")
@@ -461,6 +500,39 @@ class HttpTests(unittest.TestCase):
         code, _, body = self.get("/?q=" + "a" * (self.v.MAX_QUERY_CHARS + 1))
         self.assertEqual(code, 400)
         self.assertIn("Search too long", body)
+
+    def test_a_trickling_connection_is_cut_at_the_deadline(self):
+        # one byte just inside the per-read timeout used to hold a slot for ever
+        import socket
+        import time
+        saved = self.v.REQUEST_TIMEOUT_S
+        self.v.REQUEST_TIMEOUT_S = 1
+        try:
+            s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            start = time.monotonic()
+            closed = False
+            for ch in b"GET / HTTP/1.0\r\nX-Slow: " + b"a" * 20:
+                try:
+                    s.sendall(bytes([ch]))
+                except OSError:
+                    closed = True
+                    break
+                time.sleep(0.2)
+                s.setblocking(False)
+                try:
+                    if s.recv(1) == b"":
+                        closed = True
+                        break
+                except BlockingIOError:
+                    pass
+                finally:
+                    s.setblocking(True)
+            elapsed = time.monotonic() - start
+            s.close()
+        finally:
+            self.v.REQUEST_TIMEOUT_S = saved
+        self.assertTrue(closed, "the connection was never cut")
+        self.assertLess(elapsed, 3)
 
     def test_requests_beyond_the_limit_are_closed_not_queued(self):
         import socket

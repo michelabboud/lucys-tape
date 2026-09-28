@@ -51,6 +51,18 @@ LEAK_RX = re.compile(
 FAKE_B64 = "MIIEpAIBAAKCAQEA" + "x" * 48  # 64-char base64-ish line, like real PEM body
 
 
+class ViewerKeyTests(unittest.TestCase):
+    def test_a_printed_viewer_link_loses_its_key(self):
+        key = "Zx9_-" + "q" * 38
+        out = extract.redact(f"viewer up → http://127.0.0.1:8124/?key={key}  (stop: tape stop)")
+        self.assertNotIn(key, out)
+        self.assertIn("http://127.0.0.1:8124/?key=[REDACTED viewer key]", out)
+
+    def test_an_ordinary_query_parameter_is_left_alone(self):
+        text = "see http://127.0.0.1:8124/?q=key%3Dvalue and ?key=short"
+        self.assertEqual(extract.redact(text), text)
+
+
 class PemRedactionTests(unittest.TestCase):
     def assert_guard_clean(self, text):
         self.assertIsNone(LEAK_RX.search(text),

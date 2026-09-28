@@ -31,10 +31,10 @@ Design notes worth knowing before editing:
 import html
 import re
 import secrets
+import socket
 import sqlite3
 import sys
 import threading
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -47,10 +47,12 @@ PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8124
 # needs that cookie before the database is touched. Both are new at every launch.
 ACCESS_KEY = secrets.token_urlsafe(32)
 SESSION = secrets.token_urlsafe(32)
-COOKIE = "lt_session"
+# the port is part of the name: browsers share cookies across every port of a host, and
+# two viewers (two clones) must not overwrite each other's session
+COOKIE = f"lt_session_{PORT}"
 MAX_QUERY_CHARS = 500      # a search longer than this is refused, not run (LT-SEC-010)
 MAX_CONCURRENT = 16        # requests handled at once; more are closed (LT-SEC-010)
-REQUEST_TIMEOUT_S = 30     # a connection idle this long is dropped (LT-SEC-010)
+REQUEST_TIMEOUT_S = 30     # a connection is closed this long after it opened, however it trickles (LT-SEC-010)
 DB = ARCHIVE / "conversations.db"
 
 PAGE_SIZE = 50
@@ -665,6 +667,25 @@ def page(body, nonce, title="Lucy's Tape"):
         f'<script nonce="{nonce}">{JS}</script></body></html>').encode()
 
 
+def same(given, expected):
+    """Constant-time comparison that also takes non-ASCII input (compare_digest refuses
+    non-ASCII str with an exception)."""
+    return given is not None and secrets.compare_digest(given.encode(), expected.encode())
+
+
+def session_cookie(header):
+    """Our cookie's value from a Cookie header, or None.
+
+    Parsed by hand: other servers on 127.0.0.1 set cookies too, the browser sends them
+    all to every port, and SimpleCookie drops the whole header at the first one it cannot
+    parse, which would lock the user out."""
+    for part in header.split(";"):
+        name, eq, value = part.strip().partition("=")
+        if eq and name == COOKIE:
+            return value
+    return None
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "LucysTape"
     sys_version = ""
@@ -709,20 +730,15 @@ class H(BaseHTTPRequestHandler):
             self.plain(403, "This viewer only answers at its own address (127.0.0.1).")
             return False
         if "key" in qs:
-            if secrets.compare_digest(qs["key"][0], ACCESS_KEY):
+            if same(qs["key"][0], ACCESS_KEY):
                 rest = {k: v[0] for k, v in qs.items() if k != "key"}
-                self.plain(303, "", (("Location", url(u.path, **rest)),
+                # "/" + the path without its leading slashes: "//host" would be another site
+                self.plain(303, "", (("Location", url("/" + u.path.lstrip("/"), **rest)),
                                      ("Set-Cookie", f"{COOKIE}={SESSION}; HttpOnly; SameSite=Strict; Path=/")))
             else:
                 self.plain(403, "That link is from an earlier launch. Run `tape serve` for the current one.")
             return False
-        jar = SimpleCookie()
-        try:
-            jar.load(self.headers.get("Cookie", ""))
-        except Exception:
-            pass
-        got = jar.get(COOKIE)
-        if got is None or not secrets.compare_digest(got.value, SESSION):
+        if not same(session_cookie(self.headers.get("Cookie", "")), SESSION):
             self.plain(401, "Open the link `tape serve` printed (it carries this launch's key).")
             return False
         return True
@@ -822,11 +838,31 @@ class Server(ThreadingHTTPServer):
             self.slots.release()
             raise
 
+    def handle_error(self, request, client_address):
+        # a client that hung up (or was cut at the deadline) is not a server error;
+        # anything else keeps the full traceback in viewer.log
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
     def process_request_thread(self, request, client_address):
+        # the handler's timeout bounds each read; this bounds the whole connection, so a
+        # client sending one byte just inside the timeout cannot hold a slot for ever
+        deadline = threading.Timer(REQUEST_TIMEOUT_S, close_socket, (request,))
+        deadline.daemon = True
+        deadline.start()
         try:
             super().process_request_thread(request, client_address)
         finally:
+            deadline.cancel()
             self.slots.release()
+
+
+def close_socket(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass  # already closed by the handler: nothing left to cut
 
 
 def main():

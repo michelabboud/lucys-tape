@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2.20 — 2026-09-28 · the viewer, after its review
+
+Fixes from the deep review of 0.2.19.
+
+### Fixed
+
+- **A cookie from another local web server could lock you out of the viewer.** Browsers send
+  every `127.0.0.1` cookie to every port, and Python's cookie parser gave up on the whole header
+  at the first cookie it could not read. The viewer now reads its own cookie by hand, and the
+  cookie name carries the port (`lt_session_8124`), so two viewers no longer overwrite each
+  other's session.
+- **Notes with non-English names were left out of the database.** 0.2.19's id schema accepted
+  ASCII only; a note named `Café` has the id `note-café-…`. Ids may now hold letters of any
+  script. Pages escape and URL-encode them as before.
+- **A non-ASCII key or cookie raised an error** instead of a plain refusal.
+- **16 slow connections could shut everyone out of the viewer.** The 30-second limit applied
+  to each read, so a client sending a byte every 29 seconds held its slot for ever. The limit
+  now covers the whole connection.
+- A client hanging up no longer writes a traceback into `viewer.log`.
+
+### Security
+
+- The redactor removes the viewer's key from a printed `tape serve` link
+  (`127.0.0.1:<port>/?key=…`), so a session that ran `tape serve` does not archive it.
+- The redirect after the key always stays on the viewer's own address. (The request parser
+  already turned `//host/path` into a path, so this was not reachable; it is defence in depth.)
+
+### Notes
+
+- The key stays valid for the whole launch, and the keyed link stays in browser history until
+  the viewer stops. Anyone who can read your browser history on this account can already read
+  the archive.
+
 ## v0.2.19 — 2026-09-28 · the viewer answers only you
 
 ### Security

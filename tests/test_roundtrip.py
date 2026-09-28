@@ -159,6 +159,12 @@ class MetadataSchemaTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(build.clean_meta({**self.GOOD, "sid": bad}, "safe-stem")["sid"], "safe-stem")
 
+    def test_ids_in_any_script_are_kept(self):
+        # a note named "Café à Tōkyō" gets the id note-café-à-tōkyō (review of 0.2.19)
+        for sid in ("note-café-à-tōkyō", "note-заметка", "note-笔记"):
+            with self.subTest(sid=sid):
+                self.assertEqual(build.clean_meta({**self.GOOD, "sid": sid}, "stem")["sid"], sid)
+
     def test_no_valid_id_anywhere_means_the_file_is_skipped(self):
         self.assertIsNone(build.clean_meta({**self.GOOD, "sid": "<b>"}, "bad stem<"))
 

@@ -28,9 +28,11 @@ BODY_ESC = "<!--esc-->"  # see escape_body() in extract_conversations.py
 
 # The schema every metadata value must meet before it reaches the database (LT-SEC-008).
 # The viewer escapes on output as well; this is the second wall. Measured on 13,748 real
-# files (2026-09-28): ids use only these characters and are at most 55 long, timestamps
-# are ISO-8601, counts are integers, the longest free-text field is 350 characters.
-SID_RX = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+# files (2026-09-28): ids are at most 55 long, timestamps are ISO-8601, counts are
+# integers, the longest free-text field is 350 characters. Ids may hold letters of any
+# script (a note named "Café" has the id note-café-…): every page escapes and URL-encodes
+# them, so the schema only has to keep out spaces, markup and path characters.
+SID_RX = re.compile(r"[\w.:-]{1,128}")
 TS_RX = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d{1,9})?)?(Z|[+-]\d\d:?\d\d)?")
 MAX_COUNT = 10**9
 MAX_TEXT = {"project": 1000, "branch": 1000, "models": 2000}
